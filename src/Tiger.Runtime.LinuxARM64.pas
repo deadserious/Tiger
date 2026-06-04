@@ -19,34 +19,31 @@ uses
   Tiger.Types,
   Tiger.Common,
   Tiger.IR,
-  Tiger.Runtime;
+  Tiger.Runtime,
+  Tiger.ABI.LinuxARM64;
 
 type
   //============================================================================
-  // TTigerLinuxARM64Runtime - Linux x86-64 runtime library injection.
-  // Uses raw syscalls instead of DLL imports for Phase 1.
+  // TTigerLinuxARM64Runtime - Linux aarch64 runtime library injection.
+  // Uses raw syscalls and libc.so.6 dynamic imports (same IR model as Linux64).
   //============================================================================
 
   { TTigerLinuxARM64Runtime }
   TTigerLinuxARM64Runtime = class(TTigerRuntime)
   public
-    /// <summary>Injects the Tiger_Halt procedure (exit via syscall 60).</summary>
+    /// <summary>Injects the Tiger_Halt procedure (exit via aarch64 syscall 93).</summary>
     procedure AddSystem(const AIR: TTigerIR; const AOptLevel: Integer); override;
 
     /// <summary>Injects console I/O stubs (Tiger_InitConsole as no-op).</summary>
     procedure AddIO(const AIR: TTigerIR); override;
 
-    /// <summary>Memory runtime — stub for Phase 2.</summary>
     procedure AddMemory(const AIR: TTigerIR; const AOptLevel: Integer); override;
 
-    /// <summary>String runtime — stub for Phase 2.</summary>
     procedure AddStrings(const AIR: TTigerIR); override;
     procedure AddTypes(const AIR: TTigerIR); override;
 
-    /// <summary>Exception runtime — stub for Phase 2.</summary>
     procedure AddExceptions(const AIR: TTigerIR); override;
 
-    /// <summary>Command-line arguments — stub for now.</summary>
     procedure AddCommandLine(const AIR: TTigerIR); override;
   end;
 
@@ -60,7 +57,7 @@ procedure TTigerLinuxARM64Runtime.AddSystem(const AIR: TTigerIR; const AOptLevel
 begin
   //----------------------------------------------------------------------------
   // Tiger_Halt(AExitCode: Int32)
-  // Terminates the process via Linux exit syscall (nr 60).
+  // Terminates the process via Linux aarch64 exit syscall (nr 93).
   // At opt level 0, calls Tiger_ReportLeaks before exit for heap leak detection.
   // No DLL imports needed — syscalls go direct to kernel.
   //----------------------------------------------------------------------------
@@ -70,7 +67,7 @@ begin
   AIR.Call('Tiger_FreeCommandLine', []);
   if AOptLevel = 0 then
     AIR.Call('Tiger_ReportLeaks', []);
-  AIR.SyscallStmt(60, [AIR.Get('AExitCode')])
+  AIR.SyscallStmt(LINUXARM64_SYS_EXIT, [AIR.Get('AExitCode')])
   .EndFunc();
 end;
 
@@ -90,7 +87,7 @@ begin
 end;
 
 //==============================================================================
-// TTigerLinuxARM64Runtime - Stubs (Phase 2+)
+// TTigerLinuxARM64Runtime - Memory
 //==============================================================================
 
 procedure TTigerLinuxARM64Runtime.AddMemory(const AIR: TTigerIR; const AOptLevel: Integer);
@@ -642,13 +639,13 @@ const
   SIGILL  = 4;   // Illegal instruction
   SIGBUS  = 7;   // Bus error
 
-  // Offsets within TigerExceptFrame (216 bytes total)
+  // Offsets within TigerExceptFrame (must match LINUXARM64_EXCEPT_FRAME_SIZE in backend)
   FRAME_PREV     = 0;    // PrevFrame: Pointer (8 bytes)
-  FRAME_JMPBUF   = 8;    // JmpBuf: sigjmp_buf (200 bytes)
-  FRAME_TYPE     = 208;  // FrameType: Int32 (4 bytes)
-  FRAME_SIZE     = 216;  // Total frame size (aligned to 8)
+  FRAME_JMPBUF   = 8;    // JmpBuf: glibc aarch64 sigjmp_buf (312 bytes)
+  FRAME_TYPE     = 320;  // FrameType: Int32 (4 bytes) at 8+312
+  FRAME_SIZE     = LINUXARM64_EXCEPT_FRAME_SIZE;
 
-  // sigaction structure size (glibc x86-64)
+  // sigaction structure size (glibc aarch64 — same layout as x86-64)
   // sa_handler(8) + sa_mask(128) + sa_flags(4) + padding(4) + sa_restorer(8) = 152
   SIGACTION_SIZE = 152;
 begin

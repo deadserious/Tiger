@@ -28,11 +28,13 @@ uses
   Tiger.Backend,
   Tiger.Backend.Win64,
   Tiger.Backend.Linux64,
+  Tiger.Backend.LinuxARM64,
   Tiger.Backend.MacOS64,
   Tiger.IR,
   Tiger.Runtime,
   Tiger.Runtime.Win64,
   Tiger.Runtime.Linux64,
+  Tiger.Runtime.LinuxARM64,
   Tiger.Runtime.MacOS64,
   Tiger.JIT;
 
@@ -3514,7 +3516,10 @@ begin
       FRuntime := TTigerMacOS64Runtime.Create();
     end;
     tpLinuxARM64:
-      raise EArgumentException.Create('tpLinuxARM64 target is not yet integrated');
+    begin
+      FBackend := TTigerLinuxARM64Backend.Create();
+      FRuntime := TTigerLinuxARM64Runtime.Create();
+    end;
     tpWinARM64:
       raise EArgumentException.Create('tpWinARM64 target is not yet integrated');
   else

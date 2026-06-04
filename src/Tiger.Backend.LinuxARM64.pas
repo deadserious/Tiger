@@ -19,9 +19,8 @@ uses
   System.SysUtils,
   System.Classes,
   System.IOUtils,
-  System.Generics.Collections,
   System.Math,
-  System.Hash,
+  System.Generics.Collections,
   Tiger.Utils,
   Tiger.Utils.Host,
   Tiger.ExitCodes,
@@ -31,14 +30,19 @@ uses
   Tiger.Builders,
   Tiger.Backend,
   Tiger.Backend.ARM64,
-  Tiger.JIT,
-  Tiger.ABI.MacOS64;
+  Tiger.ABI,
+  Tiger.ABI.LinuxARM64,
+  Tiger.Linker,
+  Tiger.Linker.ELF,
+  Tiger.JIT;
 
 type
   { TTigerLinuxARM64Backend }
   TTigerLinuxARM64Backend = class(TTigerBackend)
   private
-    function GenerateMachO(const AFileType: Cardinal; const AIsDylib: Boolean): TBytes;
+    function GenerateELF(): TBytes;
+    function GenerateELFObj(): TBytes;
+    function GenerateArArchive(): TBytes;
     procedure EnsureOutputDir();
   protected
     procedure PreBuild(); override;
@@ -52,97 +56,17 @@ type
 
 implementation
 
-uses
-  Tiger.ABI,
-  Tiger.Linker,
-  Tiger.Linker.MachO;
-
-const
-  ERR_BACKEND_NO_ACTIVE_FUNC = 'B001';
-
-  // Mach-O 64-bit constants
-  MH_MAGIC_64    = $FEEDFACF;
-  CPU_TYPE_ARM64 = $0100000C;
-  CPU_SUBTYPE_ARM64_ALL = 0;
-  MH_OBJECT      = 1;
-  MH_EXECUTE     = 2;
-  MH_DYLIB       = 6;
-  MH_NOUNDEFS    = $00000001;
-  MH_DYLDLINK    = $00000004;
-  MH_TWOLEVEL    = $00000080;
-  MH_PIE         = $00200000;
-  LC_SEGMENT_64  = $19;
-  LC_REQ_DYLD    = $80000000;
-  LC_MAIN        = $28 or LC_REQ_DYLD;
-  LC_LOAD_DYLINKER = $0E;
-  LC_LOAD_DYLIB   = $0C;
-  LC_ID_DYLIB     = $0D;
-  LC_DYLD_INFO_ONLY = $22 or LC_REQ_DYLD;
-  LC_VERSION_MIN_MACOSX = $24;
-  LC_CODE_SIGNATURE = $1D;
-  LC_UUID         = $1B;
-  LC_SYMTAB       = $02;
-  LC_DYSYMTAB     = $0B;
-  // Code signature blob (linker-signed ad-hoc)
-  CSMAGIC_EMBEDDED_SIGNATURE = $FADE0CC0;
-  CSMAGIC_CODEDIRECTORY = $FADE0C02;
-  CSMAGIC_REQUIREMENTS = $FADE0C01;
-  CSMAGIC_BLOBWRAPPER = $FADE0B01;
-  CSSLOT_CODEDIRECTORY = 0;
-  CSSLOT_REQUIREMENTS = 2;
-  CSSLOT_ALTERNATE_CODEDIRECTORY = $1000;
-  CSSLOT_CMS_SIGNATURE = $10000;
-  CS_CD_FLAG_ADHOC = $2;
-  CS_CD_FLAG_LINKER_SIGNED = $20000;
-  CS_HASHTYPE_SHA1 = 1;
-  CS_HASHTYPE_SHA256 = 2;
-  CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE = 88;  // version 0x20400 layout (incl. scatter/team/codeLimit64/execSeg)
-  CODE_SIGNATURE_IDENTIFIER_MIN_SIZE = 1;   // minimal identifier (null byte) required by codesign
-  CS_EXECSEG_MAIN_BINARY = $1;
-  CODE_SIGNATURE_SUPERBLOB_HEADER_SIZE = 20;
-  CODE_SIGNATURE_ALIGN = 16;  // dataoff must be 16-byte aligned for codesign to accept
-
-  SEG_TEXT = '__TEXT';
-  SEG_DATA = '__DATA';
-  SEG_LINKEDIT = '__LINKEDIT';
-  SEG_PAGEZERO = '__PAGEZERO';
-  SECT_TEXT = '__text';
-  SECT_CSTRING = '__cstring';
-  SECT_DATA = '__data';
-  SECT_GOT = '__got';
-
-  // Exception handling: TigerExceptFrame size (Prev 8 + sigjmp_buf 196 + Type 4, aligned to 16)
-  MACOS64_EXCEPT_FRAME_SIZE = 208;
-  // Set True to disable all SEH emission (inits + try/end) to isolate bus fault; restore False for normal use
-  SEH_EMIT_DISABLED = False;
-
-  // Darwin/macOS ARM64 syscall: x16 = number, x0-x5 = args, SVC #0x80, return in x0
-  // Map Linux x86_64 syscall numbers to Darwin (BSD) numbers for source compatibility
-  LINUX_SYS_READ  = 0;   // Linux x64 read
-  LINUX_SYS_WRITE = 1;   // Linux x64 write
-  LINUX_SYS_EXIT  = 60;  // Linux x64 exit
-  DARWIN_SYS_READ  = 3;  // Darwin read
-  DARWIN_SYS_WRITE = 4;  // Darwin write
-  DARWIN_SYS_EXIT  = 1;  // Darwin exit
-
-  PAGE_SIZE = 4096;
-  SEGMENT_PAGE_SIZE = 16384;  // ARM64 macOS uses 16KB pages; segment fileoff/vmsize must be 16K aligned
-  SEG_TEXT_VADDR = $0000000100000000;  // Canonical arm64 executable __TEXT base
-  SEG_DATA_VADDR = $0000000100001000;  // Keep same vmaddr-fileoff slide across segments
-
-function Sha1FromUTF8String(const Str : string) : string;
-var
-  LSHA1 : THashSHA1;
-begin
-  LSHA1 := THashSHA1.Create;
-  LSHA1.Update(TEncoding.UTF8.GetBytes(Str));
-  Result := LSHA1.HashAsString;
-end;
+//==============================================================================
+// TTigerLinuxARM64Backend
+//==============================================================================
 
 procedure TTigerLinuxARM64Backend.EnsureOutputDir();
 begin
+  // Linux executables have no extension, so CreateDirInPath would treat
+  // the filename as a directory. Temporarily append .elf to trick it
+  // into creating only the parent directories.
   if not TPath.HasExtension(FOutputPath) then
-    TUtils.CreateDirInPath(FOutputPath + '.macho')
+    TUtils.CreateDirInPath(FOutputPath + '.elf')
   else
     TUtils.CreateDirInPath(FOutputPath);
 end;
@@ -150,6 +74,7 @@ end;
 function TTigerLinuxARM64Backend.TargetExe(const APath: string;
   const ASubsystem: TTigerSubsystem): TTigerBackend;
 begin
+  // Strip any extension -- Linux executables have none by convention
   FOutputPath := ChangeFileExt(APath, '');
   FOutputType := otExe;
   FSubsystem := ASubsystem;
@@ -162,103 +87,35 @@ begin
 end;
 
 function TTigerLinuxARM64Backend.BuildToMemory(): TBytes;
-  function MakeArHeaderField(const AValue: AnsiString; const AWidth: Integer): AnsiString;
-  begin
-    Result := AValue;
-    if Length(Result) > AWidth then
-      Result := Copy(Result, 1, AWidth);
-    while Length(Result) < AWidth do
-      Result := Result + ' ';
-  end;
-
-  function GenerateArArchiveSingleObject(const AMemberName: AnsiString; const AObjectBytes: TBytes): TBytes;
-  var
-    S: TMemoryStream;
-    LHeader: AnsiString;
-    LSizeStr: AnsiString;
-    LPad: Byte;
-  begin
-    Result := nil;
-    S := TMemoryStream.Create();
-    try
-      // Global header
-      LHeader := '!<arch>'#10;
-      if Length(LHeader) > 0 then
-        S.WriteBuffer(LHeader[1], Length(LHeader));
-
-      // Member header (BSD ar)
-      // name(16) mtime(12) uid(6) gid(6) mode(8) size(10) "`\n"(2)  = 60 bytes
-      // NOTE: Tiger.Linker.MachO only supports simple names; keep <= 16 bytes.
-      LSizeStr := AnsiString(IntToStr(Length(AObjectBytes)));
-      LHeader :=
-        MakeArHeaderField(AMemberName, 16) +
-        MakeArHeaderField('0', 12) +
-        MakeArHeaderField('0', 6) +
-        MakeArHeaderField('0', 6) +
-        MakeArHeaderField('100644', 8) +
-        MakeArHeaderField(LSizeStr, 10) +
-        '`'#10;
-      S.WriteBuffer(LHeader[1], Length(LHeader));
-
-      // Member data
-      if Length(AObjectBytes) > 0 then
-        S.WriteBuffer(AObjectBytes[0], Length(AObjectBytes));
-      // Pad to even
-      if (S.Size mod 2) <> 0 then
-      begin
-        LPad := 10;
-        S.WriteBuffer(LPad, 1);
-      end;
-
-      SetLength(Result, S.Size);
-      if S.Size > 0 then
-      begin
-        S.Position := 0;
-        S.ReadBuffer(Result[0], S.Size);
-      end;
-    finally
-      S.Free();
-    end;
-  end;
 begin
   case FOutputType of
     otExe:
-      Result := GenerateMachO(MH_EXECUTE, False);
-    otDll:
-      Result := GenerateMachO(MH_DYLIB, True);
+      Result := GenerateELF();
     otObj:
-      Result := GenerateMachO(MH_OBJECT, False);
+      Result := GenerateELFObj();
     otLib:
-    begin
-      // Emit a single-member BSD ar archive containing one Mach-O relocatable object.
-      // Keep the member name short (<=16) because Tiger.Linker.MachO ParseARLibrary
-      // only supports simple member names.
-      var LObj := GenerateMachO(MH_OBJECT, False);
-      // NOTE: Don't include a trailing '/' in the filename field; macOS `ar -x`
-      // treats it as a path separator and extraction fails.
-      Result := GenerateArArchiveSingleObject('tiger.o', LObj);
-    end;
-  else
-    Result := nil;
+      Result := GenerateArArchive();
+    otDll:
+      Result := GenerateELF();  // GenerateELF handles both exe and .so
   end;
 end;
 
 function TTigerLinuxARM64Backend.BuildJIT(): TTigerJIT;
 begin
-  raise Exception.Create('Linux ARM64 JIT is not implemented');
+  {$IFDEF LINUX}
+  raise Exception.Create('Linux ARM64 JIT is not yet implemented');
+  {$ELSE}
+  raise Exception.Create('Linux ARM64 JIT requires a Linux host (mmap/dlopen). Build to file and run on Linux instead.');
+  {$ENDIF}
 end;
 
 function TTigerLinuxARM64Backend.Run(): Cardinal;
 begin
-  {$IFDEF MSWINDOWS}
-  Result := Tiger_ErrorBadFormat;
-  Status('Run not supported for Linux ARM64 target from Windows. Copy binary to Linux ARM64 and run there.');
-  {$ELSE}
-  {$IFDEF LINUX}
   if FOutputType <> otExe then
     Exit(Tiger_ErrorBadFormat);
+
   try
-    Result := THostUtils.RunExe(FOutputPath, '', ExtractFilePath(FOutputPath));
+    Result := THostUtils.RunElf(FOutputPath, ExtractFilePath(FOutputPath));
   except
     on E: Exception do
     begin
@@ -266,11 +123,6 @@ begin
       Result := Tiger_ErrorFileNotFound;
     end;
   end;
-  {$ELSE}
-  Result := Tiger_ErrorBadFormat;
-  Status('Run for Linux ARM64 is only supported on a Linux host.');
-  {$ENDIF}
-  {$ENDIF}
 end;
 
 procedure TTigerLinuxARM64Backend.Clear();
@@ -278,534 +130,314 @@ begin
   inherited Clear();
 end;
 
-function TTigerLinuxARM64Backend.GenerateMachO(const AFileType: Cardinal; const AIsDylib: Boolean): TBytes;
+//==============================================================================
+// GenerateELF -- Produces a minimal ELF64 executable
+//
+// Layout: [ELF header 64B] [PHDR 56B] [.rodata] [.data] [.text + _start]
+// Single PT_LOAD segment with PF_R|PF_W|PF_X (Phase 1 simplicity).
+//==============================================================================
+
+function TTigerLinuxARM64Backend.GenerateELF(): TBytes;
+const
+  //--------------------------------------------------------------------------
+  // ELF64 Constants
+  //--------------------------------------------------------------------------
+  ELF_MAGIC: array[0..3] of Byte = ($7F, $45, $4C, $46);
+
+  ELFCLASS64    = 2;
+  ELFDATA2LSB   = 1;
+  EV_CURRENT    = 1;
+  ELFOSABI_NONE = 0;
+
+  ET_EXEC       = 2;
+  ET_DYN        = 3;   // Shared object
+  EM_AARCH64    = 183;
+
+  PT_LOAD       = 1;
+
+  PF_X          = 1;
+  PF_W          = 2;
+  PF_R          = 4;
+
+  ELF64_EHDR_SIZE = 64;
+  ELF64_PHDR_SIZE = 56;
+
+  BASE_VADDR    = $400000;
+
+  // Program header types
+  PT_INTERP     = 3;
+  PT_DYNAMIC    = 2;
+  PT_PHDR       = 6;
+  PT_GNU_STACK  = $6474E551;
+
+  // Section header types
+  SHT_NULL      = 0;
+  SHT_PROGBITS  = 1;
+  SHT_STRTAB    = 3;
+  SHT_RELA      = 4;
+  SHT_HASH      = 5;
+  SHT_DYNAMIC   = 6;
+  SHT_DYNSYM    = 11;
+
+  // Section header flags
+  SHF_WRITE     = 1;
+  SHF_ALLOC     = 2;
+  SHF_EXECINSTR = 4;
+  SHF_INFO_LINK = $40;
+
+  // Dynamic section tags
+  DT_NULL       = 0;
+  DT_NEEDED     = 1;
+  DT_HASH       = 4;
+  DT_STRTAB     = 5;
+  DT_SYMTAB     = 6;
+  DT_STRSZ      = 10;
+  DT_SYMENT     = 11;
+  DT_PLTGOT     = 3;
+  DT_PLTRELSZ   = 2;
+  DT_PLTREL     = 20;
+  DT_JMPREL     = 23;
+  DT_RELA       = 7;
+  DT_INIT       = 12;
+  DT_SONAME     = 14;
+  DT_RUNPATH    = 29;
+
+  // Symbol binding/type
+  STB_GLOBAL    = 1;
+  STT_FUNC      = 2;
+
+  // Relocation types
+  R_AARCH64_JUMP_SLOT = 1026;
+
+  // Sizes
+  ELF64_SHDR_SIZE = 64;
+  ELF64_SYM_SIZE  = 24;
+  ELF64_RELA_SIZE = 24;
+  ELF64_DYN_SIZE  = 16;
+
 var
-  LCode: TTigerCodeBuilder;
-  LData: TTigerDataBuilder;
-  LGlobals: TTigerDataBuilder;
-  LImports: TTigerImportBuilder;
-  LFuncCount, LFuncIdx, LInstrIdx, LI, LK: Integer;
+  LRoDataSection: TMemoryStream;
+  LDataSection: TMemoryStream;
+  LTextSection: TMemoryStream;
+
   LFunc: TTigerFuncInfo;
+  LFuncOffsets: TArray<Cardinal>;
+  LMainIndex: Integer;
+  LDllMainIndex: Integer;   // DllMain function index for .so _init
+  LI: Integer;
+  LJ: Integer;
+  LK: Integer;
   LInstr: TTigerInstruction;
-  LTextStream, LCStringStream, LDataStream, LGotStream: TMemoryStream;
-  LTextBytes, LCStringBytes, LDataBytes, LGotBytes: TBytes;
-  LEntryOffset: UInt64;
-  LFuncOffsets: TDictionary<Integer, Cardinal>;
-  LCallFixups: TList<TPair<Cardinal, Integer>>;
-  LImportFixups: TList<TPair<Cardinal, Integer>>;
-  LDataFixups: TList<TPair<Cardinal, Integer>>;
-  LGlobalFixups: TList<TPair<Cardinal, Integer>>;
-  LDataPageFixups: TList<Cardinal>;  // One ADRP per function that uses globals; targets __data base
-  LFuncAddrFixups: TList<TPair<Cardinal, Integer>>;  // Code offset -> (func index shl 8 or reg) for @func
-  LLabelOffsets: TDictionary<Integer, Cardinal>;
-  LFloatTemps: TDictionary<Integer, Boolean>;
-  LJumpFixups: TList<TPair<Cardinal, Integer>>;
-  LCondJumpFixups: TList<TPair<Cardinal, Integer>>;
-  LForwardJumpFixups: TList<TPair<Cardinal, Cardinal>>;  // (jump_offset, target_offset) for forward jumps
-  LOutStream: TMemoryStream;
-  LHeaderSize, LLoadCmdSize: Cardinal;
-  LSegTextFileOff, LSegTextFileSize, LSegDataFileOff, LSegDataFileSize, LSegDataSegmentFileSize: Cardinal;
-  LSegLinkEditFileOff, LSegLinkEditFileSize: Cardinal;
-  LTextSectionFileOff: Cardinal;
-  LTextMapSize: Cardinal;
-  LSlide: UInt64;
-  LTextFileOff, LCStringFileOff, LDataFileOff, LGotFileOff: Cardinal;
-  LGotVAddr, LSlotAddr: UInt64;
-  LOfs12: Cardinal;
-  LFrameSize, LLocalsSize, LMaxCallArgs, LOutgoingArgSpace: Cardinal;
-  LIncomingSpillSize: Cardinal;
-  LStackFrameSize, LVariadicSize: Cardinal;
+  LExportName: string;
+  LParamTypes: TArray<TTigerValueType>;
+
+  // Fixup lists
+  LCallFixups: TList<TPair<Cardinal, Integer>>;       // Code offset -> func index
+  LJumpFixups: TList<TPair<Cardinal, Integer>>;       // Code offset -> label index
+  LDataFixups: TList<TPair<Cardinal, Integer>>;       // Code offset -> data index (.rodata)
+  LGlobalFixups: TList<TPair<Cardinal, Integer>>;     // Code offset -> data index (.data)
+  LFuncAddrFixups: TList<TPair<Cardinal, Integer>>;   // Code offset -> func index (LEA)
+  LLabelOffsets: TArray<Cardinal>;
+
+  // Stack frame
+  LLocalsSize: Integer;
+  LMaxCallArgs: Integer;
+  LOutgoingArgSpace: Cardinal;
+  LStackFrameSize: Cardinal;
+
+  // Backpatch temps
+  LCodeOffset: Cardinal;
+  LDataIndex: Integer;
+  LDisp: Int32;
+
+  // ELF assembly
+  LRoDataFileOffset: Cardinal;
+  LDataFileOffset: Cardinal;
+  LTextFileOffset: Cardinal;
+  LEntryPointOffset: Cardinal;
+  LMainOffset: Cardinal;
+  LTextSize: Cardinal;
+  LEntryVAddr: UInt64;
+  LTotalFileSize: Cardinal;
+
+  LResult: TMemoryStream;
+  LDataHandle: TTigerDataHandle;
+  LDataEntryRec: TTigerDataEntry;
+
+  // Dynamic linking
+  LHasImports: Boolean;
+  LImportCount: Integer;
+  LIsSharedObject: Boolean;                     // True when building .so
+  LHasExports: Boolean;
+  LNumExports: Integer;
+  LExportFuncs: TList<TPair<Integer, string>>;  // Function index, export name
+  LExportDynstrOffsets: TArray<Cardinal>;
+  LSoName: string;                              // SONAME for shared objects
+  LSoNameDynstrOffset: Cardinal;                // Offset of SONAME in .dynstr
+  LRunpathDynstrOffset: Cardinal;               // Offset of RUNPATH in .dynstr
+  LPhdrCount: Integer;
+  LPhdrTableSize: Cardinal;
+  LEntry: TTigerImportEntry;
+
+  // Dynamic linking sections
+  LInterpSection: TMemoryStream;
+  LHashSection: TMemoryStream;
+  LDynsymSection: TMemoryStream;
+  LDynstrSection: TMemoryStream;
+  LRelaPltSection: TMemoryStream;
+  LPltSection: TMemoryStream;
+  LGotPltSection: TMemoryStream;
+  LDynamicSection: TMemoryStream;
+  LShstrtabSection: TMemoryStream;
+
+  // Dynamic linking offsets
+  LInterpFileOffset: Cardinal;
+  LHashFileOffset: Cardinal;
+  LDynsymFileOffset: Cardinal;
+  LDynstrFileOffset: Cardinal;
+  LRelaPltFileOffset: Cardinal;
+  LPltFileOffset: Cardinal;
+  LGotPltFileOffset: Cardinal;
+  LDynamicFileOffset: Cardinal;
+  LShstrtabFileOffset: Cardinal;
+  LShdrsFileOffset: Cardinal;
+  LSectionCount: Integer;
+  LInterpOffset: Integer;   // 1 for executables (has .interp), 0 for shared objects
+
+  // Dynamic linking helpers
+  LDynstrPos: Cardinal;
+  LLibNames: TStringList;
+  LLibDynstrOffsets: TArray<Cardinal>;
+  LSymDynstrOffsets: TArray<Cardinal>;
+  LPltFixups: TList<TPair<Cardinal, Integer>>;  // Code offset -> import index
+  LHashVal: Cardinal;
+  LNBuckets: Cardinal;
+  LBuckets: TArray<Cardinal>;
+  LChains: TArray<Cardinal>;
+  LPltEntryFileOffset: Cardinal;
+  LGotEntryVAddr: UInt64;
+  LRipAfterInstr: UInt64;
+  LShstrPos: Cardinal;
+
+  // Static linking
+  LLinker: TTigerELFLinker;
   LStaticImportIndices: TList<Integer>;
+  LDynamicImportIndices: TList<Integer>;  // Original indices of non-static imports
   LStaticSymbolNames: TStringList;
   LStaticLibPaths: TStringList;
-  LStaticCallFixups: TList<TPair<Cardinal, Integer>>;
   LStaticResolved: TDictionary<string, TLinkerResolvedSymbol>;
+  LStaticImportResolved: TDictionary<Integer, Cardinal>;
   LHasStaticImports: Boolean;
-  LLinker: TTigerMachOLinker;
   LExternalTextBase: Cardinal;
+  LTargetOffset: Cardinal;
   LMergedBytes: TBytes;
   LResolvedSym: TLinkerResolvedSymbol;
-  LEntry: TTigerImportEntry;
-  LLibPath, LResolvedPath, LCandidate: string;
-  LJ: Integer;
-  LBindStream: TMemoryStream;
-  LBindBytes: TBytes;
-  LRebaseBytes: TBytes;
-  LExportBytes: TBytes;
-  LSymtabBytes, LStrtabBytes: TBytes;
-  LBindOff: Cardinal;
-  LExportOff, LSymtabOff, LStrtabOff: Cardinal;
-  LRebaseOff: Cardinal;
-  LCodeLimit: Cardinal;
-  LSignatureOffset: Cardinal;
-  LSignatureSize: Cardinal;
-  LNumPages: Cardinal;
-  LPadding: Cardinal;
-  LSignatureBytes: TBytes;
-  LVal: UInt64;
-  LLabelOffset: Cardinal;
-  LAdrpImm: Cardinal;
-  LByteVal: Byte;
-  LCardVal: Cardinal;
-  LByteOffset: Int64;
-  LPageIndex: Int64;
-  LTargetIndex: Integer;
-  LTargetReg: Byte;
-  LDataHandle: TTigerDataHandle;
-  LUUID: TGUID;
-  LIdName: AnsiString;
-  LCmdCount: Cardinal;
-  LDylibNames: TStringList;
-  LDylibOrdinals: TDictionary<string, Integer>;
-  LDylibName: string;
-  LDylibOrdinal: Integer;
-  LDylibCmdSizeTotal: Cardinal;
-  LDylibCmdSize: Cardinal;
-  LNamePaddedSize: Cardinal;
+  LImportIndex: Integer;
+  LOrigImportIndex: Integer;
+  LPltSlotIndex: Integer;
+  LOrigToPltIndex: TDictionary<Integer, Integer>;  // original import index -> PLT slot
+  LStaticFuncName: string;
+  LLibPath: string;
+  LResolvedPath: string;
+  LCandidate: string;
 
+  // Exception handling (Linux64: setjmp/longjmp based)
+  LExceptFrameSize: Integer;
+  LExceptFrameBaseOffset: Integer;
+  LTryBeginLabels: TDictionary<Integer, Integer>;   // label index -> scope index
+  LExceptLabels: TDictionary<Integer, Integer>;     // label index -> scope index
+  LFinallyLabels: TDictionary<Integer, Integer>;    // label index -> scope index
+  LEndLabels: TDictionary<Integer, Integer>;        // label index -> scope index
   LHasSEH: Boolean;
-  LPushExceptFrameIdx, LPopExceptFrameIdx, LGetExceptFrameIdx: Integer;
-  LInitExceptionsIdx, LInitSignalsIdx: Integer;
-  LRaiseCodeIdx: Integer;
+  LPushExceptFrameIdx: Integer;
+  LPopExceptFrameIdx: Integer;
+  LGetExceptFrameIdx: Integer;
   LSigsetjmpIdx: Integer;
-  LTryBeginLabels, LExceptLabels, LFinallyLabels, LEndLabels: TDictionary<Integer, Integer>;
-  LExceptFrameSize, LExceptFrameBaseOffset: Cardinal;
-  LScopeIdx, LExceptLabelIdx: Integer;
-  LFrameOffset: Cardinal;
-  LGotStartOffset: Cardinal;
+  LInitExceptionsIdx: Integer;
+  LInitSignalsIdx: Integer;
+  LInitCommandLineIdx: Integer;
+  LScopeIdx: Integer;
+  LFrameOffset: Integer;
+  LExceptLabelIdx: Integer;
+  //LFinallyLabelIdx: Integer;
 
-  function AlignUp32Local(const AValue: Cardinal; const AAlignment: Cardinal): Cardinal;
+  // Float arg classification for System V ABI
+  LFloatTemps: TDictionary<Integer, Boolean>;
+  LIntArgIdx: Integer;
+  LXmmArgIdx: Integer;
+  LDataPageFixups: TList<Cardinal>;
+  LCondJumpFixups: TList<TPair<Cardinal, Integer>>;
+  LForwardJumpFixups: TList<TPair<Cardinal, Cardinal>>;
+  LPageIndex: Int64;
+  LAdrpImm: Cardinal;
+  LInsn: Cardinal;
+  LTargetReg: Byte;
+  LTargetIndex: Integer;
+  LInstrIdx: Integer;
+  LOfs12: Cardinal;
+  LIncomingSpillSize: Cardinal;
+
+  //--------------------------------------------------------------------------
+  // Emit helpers (write to LTextSection)
+  //--------------------------------------------------------------------------
+
+  procedure EmitARM64(const AInsn: Cardinal);
   begin
-    if AAlignment <= 1 then
-      Exit(AValue);
-    Result := (AValue + AAlignment - 1) and (not (AAlignment - 1));
+    LTextSection.WriteData(AInsn);
   end;
 
-  function BytesToHexLower(const ABytes: TBytes): string;
-  const
-    HEX: array[0..15] of Char = ('0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f');
+  procedure PatchAdrpAdd(const ACodeOffset: Cardinal; const ATargetVA: UInt64; const AReg: Byte);
   var
-    I: Integer;
+    LInsnVA: UInt64;
+    LPageIdx: Int64;
+    LAdrp: Cardinal;
+    LOfs12: Cardinal;
+    LInsn: Cardinal;
   begin
-    SetLength(Result, Length(ABytes) * 2);
-    for I := 0 to Length(ABytes) - 1 do
-    begin
-      Result[I * 2 + 1] := HEX[(ABytes[I] shr 4) and $F];
-      Result[I * 2 + 2] := HEX[ABytes[I] and $F];
-    end;
+    LInsnVA := BASE_VADDR + LTextFileOffset + ACodeOffset;
+    LPageIdx := Int64(ATargetVA shr 12) - Int64(LInsnVA shr 12);
+    LAdrp := Cardinal((Int32(LPageIdx) + (1 shl 21)) and $1FFFFF);
+    LOfs12 := Cardinal(ATargetVA and $FFF);
+    LInsn := $90000000 or AReg or ((LAdrp and 3) shl 29) or (((LAdrp shr 2) and $7FFFF) shl 5);
+    LTextSection.Position := ACodeOffset;
+    LTextSection.WriteData(LInsn);
+    LInsn := $91000000 or (LOfs12 shl 10) or (Cardinal(AReg) shl 5) or AReg;
+    LTextSection.WriteData(LInsn);
   end;
 
-  function MachOSymbolName(const AName: string): string;
-  begin
-    // Mach-O external symbol names are underscore-prefixed on Darwin toolchains.
-    if (AName <> '') and (AName[1] <> '_') then
-      Result := '_' + AName
-    else
-      Result := AName;
-  end;
-
-  function MachOStaticImportSymbolName(const AEntry: TTigerImportEntry): string;
-  begin
-    // IMPORTANT:
-    // At backend emit time, `TTigerIR.EmitTo` has already applied linkage-based
-    // mangling to the import name (plC = plain, plDefault = Itanium). So here we
-    // only need to apply Mach-O's leading '_' external symbol convention.
-    Result := MachOSymbolName(AEntry.FuncName);
-  end;
-
-  procedure WriteFixedAnsi(const AText: AnsiString; const ASize: Integer);
+  procedure PatchBL(const ACodeOffset: Cardinal; const ATargetSectionOffset: Cardinal);
   var
-    LBuf: TBytes;
-    LCopyLen: Integer;
+    LImm26: Int32;
   begin
-    SetLength(LBuf, ASize);
-    FillChar(LBuf[0], ASize, 0);
-    LCopyLen := Length(AText);
-    if LCopyLen > ASize then
-      LCopyLen := ASize;
-    if LCopyLen > 0 then
-      Move(AText[1], LBuf[0], LCopyLen);
-    LOutStream.WriteBuffer(LBuf[0], ASize);
+    LImm26 := Int32(ATargetSectionOffset) - Int32(ACodeOffset);
+    LImm26 := LImm26 div 4;
+    LTextSection.Position := ACodeOffset;
+    LTextSection.WriteData($94000000 or (Cardinal(LImm26) and $3FFFFFF));
   end;
 
-  procedure WritePaddedCString(const AText: AnsiString; const ASize: Integer);
+  procedure PatchCondBranch(const ACodeOffset: Cardinal; const ATargetOffset: Cardinal);
   var
-    LBuf: TBytes;
-    LCopyLen: Integer;
+    LImm19: Int32;
+    LInsn: Cardinal;
   begin
-    SetLength(LBuf, ASize);
-    FillChar(LBuf[0], ASize, 0);
-    LCopyLen := Length(AText);
-    if LCopyLen > (ASize - 1) then
-      LCopyLen := ASize - 1;
-    if LCopyLen > 0 then
-      Move(AText[1], LBuf[0], LCopyLen);
-    LOutStream.WriteBuffer(LBuf[0], ASize);
+    LImm19 := Int32(ATargetOffset) - Int32(ACodeOffset);
+    LImm19 := LImm19 div 4;
+    LTextSection.Position := ACodeOffset;
+    LTextSection.ReadData(LInsn, 4);
+    LTextSection.Position := ACodeOffset;
+    LTextSection.WriteData((LInsn and $FFF0001F) or ((Cardinal(LImm19) and $7FFFF) shl 5));
   end;
 
-  function AlignUp8(const AValue: Cardinal): Cardinal;
-  begin
-    Result := (AValue + 7) and (not 7);
-  end;
-
-  function NormalizeDylibName(const AName: string): string;
+  procedure PatchUncondBranch(const ACodeOffset: Cardinal; const ATargetOffset: Cardinal);
   var
-    L: string;
+    LImm26: Int32;
   begin
-    L := AName;
-    if L = '' then
-      Exit('/usr/lib/libSystem.B.dylib');
-
-    // Many existing tests use Linux-style libc names on non-Windows platforms.
-    // On macOS, map those to libSystem so existing code keeps working.
-    if L.Contains('libc.so') or L.Contains('libm.so') then
-      Exit('/usr/lib/libSystem.B.dylib');
-
-    Result := L;
+    LImm26 := Int32(ATargetOffset) - Int32(ACodeOffset);
+    LImm26 := LImm26 div 4;
+    LTextSection.Position := ACodeOffset;
+    LTextSection.WriteData($14000000 or (Cardinal(LImm26) and $3FFFFFF));
   end;
 
-  function AlignUp32(const AValue, AAlignment: Cardinal): Cardinal;
-  begin
-    if AAlignment <= 1 then
-      Exit(AValue);
-    Result := (AValue + AAlignment - 1) and (not (AAlignment - 1));
-  end;
-
-  procedure PutU32BE(var ABuf: TBytes; AOffset: Cardinal; AValue: Cardinal);
-  begin
-    ABuf[AOffset] := Byte((AValue shr 24) and $FF);
-    ABuf[AOffset + 1] := Byte((AValue shr 16) and $FF);
-    ABuf[AOffset + 2] := Byte((AValue shr 8) and $FF);
-    ABuf[AOffset + 3] := Byte(AValue and $FF);
-  end;
-
-  procedure PutU64BE(var ABuf: TBytes; AOffset: Cardinal; AValue: UInt64);
-  begin
-    PutU32BE(ABuf, AOffset, Cardinal(AValue shr 32));
-    PutU32BE(ABuf, AOffset + 4, Cardinal(AValue and $FFFFFFFF));
-  end;
-
-  procedure BuildLinkerSignedSignature(const AData: TBytes; ACodeLimit, ANumPages,
-    ASignatureSize: Cardinal; AExecSegBase, AExecSegLimit: UInt64;
-    AExecSegFlags: Cardinal; const AIncludeLinkerSignedFlag: Boolean;
-    const AIncludeCmsAndRequirements: Boolean; const AIdentifierBytes: TBytes;
-    var AOutSignature: TBytes);
-  var
-    LPageStream: TMemoryStream;
-    LHashBytes: TBytes;
-    LOff: Cardinal;
-    LPageStart: Cardinal;
-    LPageLen: Cardinal;
-    LIdx: Integer;
-    LReqHashBytes: TBytes;
-
-    function HashStreamBytes(const AHashType: Byte; const AStream: TStream): TBytes;
-    begin
-      if AHashType = CS_HASHTYPE_SHA256 then
-        Exit(THashSHA2.GetHashBytes(AStream))
-      else
-        Exit(THashSHA1.GetHashBytes(AStream));
-    end;
-
-    function CodeDirectorySize(const AHashSize: Byte; const AIdentifierSize: Cardinal; const ASpecialSlots, ACodeSlots: Cardinal): Cardinal;
-    var
-      LHashStartLocal: Cardinal;
-    begin
-      // Total CodeDirectory size includes:
-      // - fixed header (CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE)
-      // - identifier bytes (CODE_SIGNATURE_IDENTIFIER_SIZE)
-      // - hash slots for special + code (ASpecialSlots + ACodeSlots) * hashSize
-      LHashStartLocal := CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE + AIdentifierSize;
-      Result := LHashStartLocal + (ASpecialSlots + ACodeSlots) * Cardinal(AHashSize);
-    end;
-
-    procedure EmitCodeDirectory(const AStart: Cardinal; const AHashType, AHashSize: Byte;
-      const AIdentifierSize: Cardinal;
-      const ASpecialSlots, ACodeSlots: Cardinal; const AFlags: Cardinal;
-      out AHashOffsetOut, ACodeHashOffsetOut, ACodeDirSizeOut: Cardinal);
-    var
-      LHashStartLocal: Cardinal;
-      LHashOffsetLocal: Cardinal;
-      LCodeHashOffsetLocal: Cardinal;
-      LCodeDirSizeLocal: Cardinal;
-      LWriteOff: Cardinal;
-    begin
-      // IMPORTANT: In Apple's CodeDirectory format, `hashOffset` points to the start
-      // of the *code* slot hashes. Special slot hashes live *before* hashOffset at:
-      //   hashOffset - nSpecialSlots * hashSize
-      // `hashOffset` is NOT the start of the full hash region.
-      LHashStartLocal := CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE + AIdentifierSize;
-      LHashOffsetLocal := LHashStartLocal + ASpecialSlots * Cardinal(AHashSize);
-      LCodeHashOffsetLocal := LHashOffsetLocal;
-      LCodeDirSizeLocal := LHashStartLocal + (ASpecialSlots + ACodeSlots) * Cardinal(AHashSize);
-
-      AHashOffsetOut := LHashOffsetLocal;
-      ACodeHashOffsetOut := LCodeHashOffsetLocal;
-      ACodeDirSizeOut := LCodeDirSizeLocal;
-
-      LWriteOff := AStart;
-      PutU32BE(AOutSignature, LWriteOff, CSMAGIC_CODEDIRECTORY);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, LCodeDirSizeLocal);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, $20400);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, AFlags);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, LHashOffsetLocal);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, ASpecialSlots);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, ACodeSlots);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, ACodeLimit);
-      Inc(LWriteOff, 4);
-      AOutSignature[LWriteOff] := AHashSize;
-      Inc(LWriteOff);
-      AOutSignature[LWriteOff] := AHashType;
-      Inc(LWriteOff);
-      AOutSignature[LWriteOff] := 0;
-      Inc(LWriteOff);
-      // pageSize is log2(PAGE_SIZE). We use 4KB pages for hashing => 12.
-      AOutSignature[LWriteOff] := 12;
-      // Advance past pageSize byte to the next u32 field (scatterOffset).
-      // DO NOT skip 3 bytes here; the next field starts immediately at offset 40.
-      Inc(LWriteOff);
-      PutU32BE(AOutSignature, LWriteOff, 0);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, 0);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, 0);
-      Inc(LWriteOff, 4);
-      PutU32BE(AOutSignature, LWriteOff, 0);
-      Inc(LWriteOff, 4);
-      PutU64BE(AOutSignature, LWriteOff, UInt64(ACodeLimit));
-      Inc(LWriteOff, 8);
-      PutU64BE(AOutSignature, LWriteOff, AExecSegBase);
-      Inc(LWriteOff, 8);
-      PutU64BE(AOutSignature, LWriteOff, AExecSegLimit);
-      Inc(LWriteOff, 8);
-      PutU64BE(AOutSignature, LWriteOff, UInt64(AExecSegFlags));
-
-      // Identifier bytes (must be consistent across all CodeDirectories)
-      if (AIdentifierSize > 0) and (Length(AIdentifierBytes) >= Integer(AIdentifierSize)) then
-        Move(AIdentifierBytes[0], AOutSignature[AStart + CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE], AIdentifierSize);
-    end;
-  begin
-    SetLength(AOutSignature, ASignatureSize);
-    FillChar(AOutSignature[0], ASignatureSize, 0);
-
-    // SuperBlob header is 12 bytes + N * 8-byte index entries.
-    // Our legacy single-blob layout used CODE_SIGNATURE_SUPERBLOB_HEADER_SIZE (=20) which is 12+1*8.
-    var LBlobCount: Cardinal;
-    var LSuperHdrSize: Cardinal;
-    var LReqSize: Cardinal;
-    var LCmsSize: Cardinal;
-    var LCdSha1Size: Cardinal := 0;
-    var LCdSha256Size: Cardinal := 0;
-    var LCdSha1Off: Cardinal := 0;
-    var LCdSha256Off: Cardinal := 0;
-    var LReqOff: Cardinal := 0;
-    var LCmsOff: Cardinal := 0;
-    var LSuperLen: Cardinal := 0;
-    var LSpecialSlots: Cardinal := 0;
-    var LHashOffSha1: Cardinal := 0;
-    var LCodeHashOffSha1: Cardinal := 0;
-    var LHashOffSha256: Cardinal := 0;
-    var LCodeHashOffSha256: Cardinal := 0;
-    var LFlags: Cardinal;
-    var LIdentifierSize: Cardinal;
-
-    LIdentifierSize := Cardinal(Length(AIdentifierBytes));
-    if LIdentifierSize < CODE_SIGNATURE_IDENTIFIER_MIN_SIZE then
-      LIdentifierSize := CODE_SIGNATURE_IDENTIFIER_MIN_SIZE;
-
-    if AIncludeCmsAndRequirements then
-    begin
-      // Static-linked binaries: match `codesign -s -` layout with sha1 + sha256 CodeDirectories.
-      LBlobCount := 4; // CodeDirectory(sha1) + Requirements + AlternateCodeDirectory(sha256) + CMS wrapper
-      LReqSize := 12;
-      LCmsSize := 8;
-      LSpecialSlots := 2; // Info.plist + Requirements (Info absent -> zero hash)
-      LCdSha1Size := CodeDirectorySize(20, LIdentifierSize, LSpecialSlots, ANumPages);
-      LCdSha256Size := CodeDirectorySize(32, LIdentifierSize, LSpecialSlots, ANumPages);
-    end
-    else
-    begin
-      LBlobCount := 1;
-      LReqSize := 0;
-      LCmsSize := 0;
-      LSpecialSlots := 0;
-      LCdSha256Size := CodeDirectorySize(32, LIdentifierSize, 0, ANumPages);
-    end;
-    LSuperHdrSize := 12 + LBlobCount * 8;
-    if AIncludeCmsAndRequirements then
-    begin
-      LCdSha1Off := LSuperHdrSize;
-      LReqOff := LCdSha1Off + LCdSha1Size;
-      LCdSha256Off := LReqOff + LReqSize;
-      LCmsOff := LCdSha256Off + LCdSha256Size;
-      LSuperLen := LCmsOff + LCmsSize;
-    end
-    else
-    begin
-      LCdSha256Off := LSuperHdrSize;
-      LSuperLen := LSuperHdrSize + LCdSha256Size;
-    end;
-
-    LOff := 0;
-    PutU32BE(AOutSignature, LOff, CSMAGIC_EMBEDDED_SIGNATURE);
-    Inc(LOff, 4);
-    PutU32BE(AOutSignature, LOff, LSuperLen);
-    Inc(LOff, 4);
-    PutU32BE(AOutSignature, LOff, LBlobCount);
-    Inc(LOff, 4);
-
-    LPageStream := TMemoryStream.Create();
-    try
-      if AIncludeLinkerSignedFlag then
-        LFlags := CS_CD_FLAG_ADHOC or CS_CD_FLAG_LINKER_SIGNED
-      else
-        LFlags := CS_CD_FLAG_ADHOC;
-
-      if AIncludeCmsAndRequirements then
-      begin
-        // Index[0] = CodeDirectory (sha1)
-        PutU32BE(AOutSignature, LOff, CSSLOT_CODEDIRECTORY);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LCdSha1Off);
-        Inc(LOff, 4);
-        // Index[1] = Requirements
-        PutU32BE(AOutSignature, LOff, CSSLOT_REQUIREMENTS);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LReqOff);
-        Inc(LOff, 4);
-        // Index[2] = Alternate CodeDirectory (sha256)
-        PutU32BE(AOutSignature, LOff, CSSLOT_ALTERNATE_CODEDIRECTORY);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LCdSha256Off);
-        Inc(LOff, 4);
-        // Index[3] = CMS wrapper
-        PutU32BE(AOutSignature, LOff, CSSLOT_CMS_SIGNATURE);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LCmsOff);
-        Inc(LOff, 4);
-
-        // Emit CodeDirectories
-        EmitCodeDirectory(LCdSha1Off, CS_HASHTYPE_SHA1, 20, LIdentifierSize, LSpecialSlots, ANumPages, LFlags, LHashOffSha1, LCodeHashOffSha1, LCdSha1Size);
-        EmitCodeDirectory(LCdSha256Off, CS_HASHTYPE_SHA256, 32, LIdentifierSize, LSpecialSlots, ANumPages, LFlags, LHashOffSha256, LCodeHashOffSha256, LCdSha256Size);
-
-        // Requirements blob (empty superblob)
-        LOff := LReqOff;
-        PutU32BE(AOutSignature, LOff, CSMAGIC_REQUIREMENTS);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LReqSize);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, 0); // count = 0
-
-        // CMS wrapper blob (empty)
-        LOff := LCmsOff;
-        PutU32BE(AOutSignature, LOff, CSMAGIC_BLOBWRAPPER);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LCmsSize);
-
-        // Special slot hashes:
-        // - slot -2 (Requirements) = hash(requirements blob)
-        // - slot -1 (Info.plist) absent -> all zeros (already)
-        LPageStream.Clear();
-        LPageStream.WriteBuffer(AOutSignature[LReqOff], LReqSize);
-        LPageStream.Position := 0;
-        LReqHashBytes := HashStreamBytes(CS_HASHTYPE_SHA1, LPageStream);
-        if Length(LReqHashBytes) >= 20 then
-          // Special slot hashes live at (hashOffset - nSpecial*hashSize)
-          Move(LReqHashBytes[0], AOutSignature[LCdSha1Off + (LHashOffSha1 - LSpecialSlots * 20) + 0 * 20], 20);
-        LPageStream.Position := 0;
-        LReqHashBytes := HashStreamBytes(CS_HASHTYPE_SHA256, LPageStream);
-        if Length(LReqHashBytes) >= 32 then
-          Move(LReqHashBytes[0], AOutSignature[LCdSha256Off + (LHashOffSha256 - LSpecialSlots * 32) + 0 * 32], 32);
-
-        // Page hashes for sha1
-        for LIdx := 0 to ANumPages - 1 do
-        begin
-          LPageStart := Cardinal(LIdx) * PAGE_SIZE;
-          LPageLen := PAGE_SIZE;
-          if LPageStart + LPageLen > ACodeLimit then
-            LPageLen := ACodeLimit - LPageStart;
-          LPageStream.Clear();
-          if LPageLen > 0 then
-            LPageStream.WriteBuffer(AData[LPageStart], LPageLen);
-          LPageStream.Position := 0;
-          LHashBytes := HashStreamBytes(CS_HASHTYPE_SHA1, LPageStream);
-          if Length(LHashBytes) >= 20 then
-            Move(LHashBytes[0], AOutSignature[LCdSha1Off + LCodeHashOffSha1 + Cardinal(LIdx) * 20], 20);
-        end;
-        // Page hashes for sha256
-        for LIdx := 0 to ANumPages - 1 do
-        begin
-          LPageStart := Cardinal(LIdx) * PAGE_SIZE;
-          LPageLen := PAGE_SIZE;
-          if LPageStart + LPageLen > ACodeLimit then
-            LPageLen := ACodeLimit - LPageStart;
-          LPageStream.Clear();
-          if LPageLen > 0 then
-            LPageStream.WriteBuffer(AData[LPageStart], LPageLen);
-          LPageStream.Position := 0;
-          LHashBytes := HashStreamBytes(CS_HASHTYPE_SHA256, LPageStream);
-          if Length(LHashBytes) >= 32 then
-            Move(LHashBytes[0], AOutSignature[LCdSha256Off + LCodeHashOffSha256 + Cardinal(LIdx) * 32], 32);
-        end;
-      end
-      else
-      begin
-        // Index[0] = CodeDirectory (sha256)
-        PutU32BE(AOutSignature, LOff, CSSLOT_CODEDIRECTORY);
-        Inc(LOff, 4);
-        PutU32BE(AOutSignature, LOff, LCdSha256Off);
-        Inc(LOff, 4);
-
-        EmitCodeDirectory(LCdSha256Off, CS_HASHTYPE_SHA256, 32, LIdentifierSize, 0, ANumPages, LFlags, LHashOffSha256, LCodeHashOffSha256, LCdSha256Size);
-
-        for LIdx := 0 to ANumPages - 1 do
-        begin
-          LPageStart := Cardinal(LIdx) * PAGE_SIZE;
-          LPageLen := PAGE_SIZE;
-          if LPageStart + LPageLen > ACodeLimit then
-            LPageLen := ACodeLimit - LPageStart;
-          LPageStream.Clear();
-          if LPageLen > 0 then
-            LPageStream.WriteBuffer(AData[LPageStart], LPageLen);
-          LPageStream.Position := 0;
-          LHashBytes := HashStreamBytes(CS_HASHTYPE_SHA256, LPageStream);
-          if Length(LHashBytes) >= 32 then
-            Move(LHashBytes[0], AOutSignature[LCdSha256Off + LCodeHashOffSha256 + Cardinal(LIdx) * 32], 32);
-        end;
-      end;
-    finally
-      LPageStream.Free();
-    end;
-  end;
-
-  procedure EmitU32(const AValue: Cardinal);
-  var
-    V: Cardinal;
-  begin
-    V := AValue;
-    LTextStream.WriteBuffer(V, 4);
-  end;
-
-  procedure EmitU64(const AValue: UInt64);
-  begin
-    LTextStream.WriteBuffer(AValue, 8);
-  end;
-
-  // We spill incoming integer/pointer args (x0-x7) to [FP-8], [FP-16], ...
-  // Locals/temps must live *below* the spill area to avoid aliasing.
-  //
-  // IMPORTANT: Even if a function has fewer than 8 params, we still reserve a
-  // minimum spill area so that temps and locals can never overlap the top slots
-  // (e.g. [FP-8]) used to preserve x0..x7 across calls.
   const
     MIN_PARAM_SPILL_SIZE = 64; // 8 regs * 8 bytes
 
@@ -859,7 +491,7 @@ var
 
   procedure EmitARM64(const AInsn: Cardinal);
   begin
-    LTextStream.WriteBuffer(AInsn, 4);
+    LTextSection.WriteData(AInsn);
   end;
 
   procedure EmitMovX(const ADest, AVal: Byte);
@@ -1119,7 +751,7 @@ var
           EmitLdrFp(AReg, GetLocalOffset(AOp.LocalHandle.Index));
       okData:
         begin
-          LDataFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), (AOp.DataHandle.Index shl 8) or AReg));
+          LDataFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, (AOp.DataHandle.Index shl 8) or AReg));
           EmitAdrp(AReg, 0);
           EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
         end;
@@ -1127,10 +759,10 @@ var
         begin
           // Emit ADRP to __data base (X16) before each load; all target same page, fixed up by LDataPageFixups.
           // Using one ADRP per load avoids preserving X16 across intervening instructions (ikAdd etc. clobber it).
-          LDataPageFixups.Add(Cardinal(LTextStream.Position));
+          LDataPageFixups.Add(LTextSection.Size);
           EmitAdrp(REG_X16, 0);
           LDataHandle.Index := AOp.DataHandle.Index;
-          LByteOffset := LGlobals.GetEntry(LDataHandle).Offset;
+          LByteOffset := FGlobals.GetEntry(LDataHandle).Offset;
           if LByteOffset <= 4095 then
             EmitARM64($91000000 or (Cardinal(LByteOffset) shl 10) or (REG_X16 shl 5) or AReg)
           else
@@ -1142,7 +774,7 @@ var
       okFunc:
         begin
           // ADRP + ADD to get address of function in __text; patched in fixup pass.
-          LFuncAddrFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), (AOp.FuncHandle.Index shl 8) or AReg));
+          LFuncAddrFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, (AOp.FuncHandle.Index shl 8) or AReg));
           EmitAdrp(AReg, 0);
           EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
         end;
@@ -1288,88 +920,81 @@ var
     end;
   end;
 
-  procedure WriteFixedAnsiObj(const LObjStream : TStream; const AText: AnsiString; const ASize: Integer);
-  var
-    LBuf: TBytes;
-    LCopyLen: Integer;
-  begin
-    SetLength(LBuf, ASize);
-    FillChar(LBuf[0], ASize, 0);
-    LCopyLen := Length(AText);
-    if LCopyLen > ASize then
-      LCopyLen := ASize;
-    if LCopyLen > 0 then
-      Move(AText[1], LBuf[0], LCopyLen);
-    LObjStream.WriteBuffer(LBuf[0], ASize);
-  end;
-
 begin
-  Result := nil;
-  LCode := GetCode();
-  LData := GetData();
-  LGlobals := GetGlobals();
-  LImports := GetImports();
-
-  // Generate a UUID once per output image; used by LC_UUID and by the
-  // codesign-like identifier we embed for static-linked binaries.
-  CreateGUID(LUUID);
-
-  LFuncCount := LCode.GetFuncCount();
-  if LFuncCount = 0 then
-  begin
-    Status('Backend: No functions to emit');
-    Exit;
-  end;
-
-  LTextStream := TMemoryStream.Create();
-  LCStringStream := TMemoryStream.Create();
-  LDataStream := TMemoryStream.Create();
-  LGotStream := TMemoryStream.Create();
-  LFuncOffsets := TDictionary<Integer, Cardinal>.Create();
+  LRoDataSection := TMemoryStream.Create();
+  LDataSection := TMemoryStream.Create();
+  LTextSection := TMemoryStream.Create();
   LCallFixups := TList<TPair<Cardinal, Integer>>.Create();
-  LImportFixups := TList<TPair<Cardinal, Integer>>.Create();
+  LJumpFixups := TList<TPair<Cardinal, Integer>>.Create();
   LDataFixups := TList<TPair<Cardinal, Integer>>.Create();
   LGlobalFixups := TList<TPair<Cardinal, Integer>>.Create();
-  LDataPageFixups := TList<Cardinal>.Create();
   LFuncAddrFixups := TList<TPair<Cardinal, Integer>>.Create();
-  LJumpFixups := TList<TPair<Cardinal, Integer>>.Create();
-  LCondJumpFixups := TList<TPair<Cardinal, Integer>>.Create();
-  LForwardJumpFixups := TList<TPair<Cardinal, Cardinal>>.Create();  // (jump_offset, target_offset) for forward jumps
-  LLabelOffsets := TDictionary<Integer, Cardinal>.Create();
-  LFloatTemps := TDictionary<Integer, Boolean>.Create();
-  LTryBeginLabels := TDictionary<Integer, Integer>.Create();
-  LExceptLabels := TDictionary<Integer, Integer>.Create();
-  LFinallyLabels := TDictionary<Integer, Integer>.Create();
-  LEndLabels := TDictionary<Integer, Integer>.Create();
+  LPltFixups := TList<TPair<Cardinal, Integer>>.Create();
+  LInterpSection := TMemoryStream.Create();
+  LHashSection := TMemoryStream.Create();
+  LDynsymSection := TMemoryStream.Create();
+  LDynstrSection := TMemoryStream.Create();
+  LRelaPltSection := TMemoryStream.Create();
+  LPltSection := TMemoryStream.Create();
+  LGotPltSection := TMemoryStream.Create();
+  LDynamicSection := TMemoryStream.Create();
+  LShstrtabSection := TMemoryStream.Create();
+  LLibNames := TStringList.Create();
+  LLibNames.CaseSensitive := False;
+  LExportFuncs := TList<TPair<Integer, string>>.Create();
+
+  // Static linking initialization
   LStaticImportIndices := TList<Integer>.Create();
+  LDynamicImportIndices := TList<Integer>.Create();
   LStaticSymbolNames := TStringList.Create();
   LStaticLibPaths := TStringList.Create();
   LStaticLibPaths.CaseSensitive := False;
   LStaticLibPaths.Sorted := True;
   LStaticLibPaths.Duplicates := dupIgnore;
-  LStaticCallFixups := TList<TPair<Cardinal, Integer>>.Create();
+  LStaticImportResolved := TDictionary<Integer, Cardinal>.Create();
+  LOrigToPltIndex := TDictionary<Integer, Integer>.Create();
+  LTryBeginLabels := TDictionary<Integer, Integer>.Create();
+  LExceptLabels := TDictionary<Integer, Integer>.Create();
+  LFinallyLabels := TDictionary<Integer, Integer>.Create();
+  LEndLabels := TDictionary<Integer, Integer>.Create();
+  LFloatTemps := TDictionary<Integer, Boolean>.Create();
+  LDataPageFixups := TList<Cardinal>.Create();
+  LCondJumpFixups := TList<TPair<Cardinal, Integer>>.Create();
+  LForwardJumpFixups := TList<TPair<Cardinal, Cardinal>>.Create();
+  LLinker := nil;
   LHasStaticImports := False;
   LHasSEH := False;
   LPushExceptFrameIdx := -1;
   LPopExceptFrameIdx := -1;
   LGetExceptFrameIdx := -1;
+  LSigsetjmpIdx := -1;
   LInitExceptionsIdx := -1;
   LInitSignalsIdx := -1;
-  LRaiseCodeIdx := -1;
-  LSigsetjmpIdx := -1;
-  LLinker := nil;
-  LDylibNames := TStringList.Create();
-  LDylibNames.CaseSensitive := False;
-  LDylibNames.Sorted := False;
-  LDylibNames.Duplicates := dupIgnore;
-  LDylibOrdinals := TDictionary<string, Integer>.Create();
+  LInitCommandLineIdx := -1;
+
   try
-    // Exception handling: detect SEH and find runtime/import indices
-    for LI := 0 to LFuncCount - 1 do
+    LHasImports := FImports.GetCount() > 0;
+    //LImportCount := FImports.GetCount();
+    LIsSharedObject := (FOutputType = otDll);
+
+    // For shared objects, extract SONAME from output path
+    if LIsSharedObject then
+      LSoName := TPath.GetFileName(FOutputPath)
+    else
+      LSoName := '';
+    LSoNameDynstrOffset := 0;
+    LRunpathDynstrOffset := 0;
+
+    //------------------------------------------------------------------------
+    // Check for exception handling and find runtime function/import indices
+    //------------------------------------------------------------------------
+    for LI := 0 to FCode.GetFuncCount() - 1 do
     begin
-      LFunc := LCode.GetFunc(LI);
+      LFunc := FCode.GetFunc(LI);
+      // Check for exception scopes
       if Length(LFunc.ExceptionScopes) > 0 then
         LHasSEH := True;
+      // Find exception runtime function indices by name
       if SameText(LFunc.FuncName, 'Tiger_PushExceptFrame') then
         LPushExceptFrameIdx := LI
       else if SameText(LFunc.FuncName, 'Tiger_PopExceptFrame') then
@@ -1380,110 +1005,354 @@ begin
         LInitExceptionsIdx := LI
       else if SameText(LFunc.FuncName, 'Tiger_InitSignals') then
         LInitSignalsIdx := LI
-      else if SameText(LFunc.FuncName, 'Tiger_RaiseCode') then
-        LRaiseCodeIdx := LI;
+      else if SameText(LFunc.FuncName, 'Tiger_InitCommandLine') then
+        LInitCommandLineIdx := LI;
     end;
-    for LI := 0 to LImports.GetCount() - 1 do
+
+    // Find __sigsetjmp import index
+    for LI := 0 to FImports.GetCount() - 1 do
     begin
-      LEntry := LImports.GetEntryByIndex(LI);
-      if SameText(LEntry.FuncName, 'sigsetjmp') then
+      LEntry := FImports.GetEntryByIndex(LI);
+      if SameText(LEntry.FuncName, '__sigsetjmp') then
       begin
         LSigsetjmpIdx := LI;
         Break;
       end;
     end;
 
-    for LI := 0 to LImports.GetCount() - 1 do
+    //------------------------------------------------------------------------
+    // Collect public functions for export (same pattern as Win64)
+    //------------------------------------------------------------------------
+    for LI := 0 to FCode.GetFuncCount() - 1 do
     begin
-      LEntry := LImports.GetEntryByIndex(LI);
+      LFunc := FCode.GetFunc(LI);
+      if LFunc.IsPublic then
+      begin
+        // Compute export name based on linkage
+        if LFunc.Linkage = plC then
+          LExportName := LFunc.FuncName
+        else
+        begin
+          SetLength(LParamTypes, Length(LFunc.Params));
+          for LJ := 0 to High(LFunc.Params) do
+            LParamTypes[LJ] := LFunc.Params[LJ].ParamType;
+          LExportName := TTigerABIMangler.MangleFunctionWithLinkage(
+            LFunc.FuncName, LParamTypes, LFunc.Linkage);
+        end;
+        LExportFuncs.Add(TPair<Integer, string>.Create(LI, LExportName));
+      end;
+    end;
+    LHasExports := LExportFuncs.Count > 0;
+    LNumExports := LExportFuncs.Count;
+
+    //========================================================================
+    // STEP 1: Build .rodata section (read-only data: strings, constants)
+    //========================================================================
+    if FData.GetSize() > 0 then
+      LRoDataSection.WriteBuffer(FData.GetDataPointer()^, FData.GetSize());
+    if LRoDataSection.Size = 0 then
+      LRoDataSection.WriteData(Byte(0));
+    AlignStream(LRoDataSection, 16);
+
+    //========================================================================
+    // STEP 2: Build .data section (writable globals)
+    //========================================================================
+    if FGlobals.GetSize() > 0 then
+      LDataSection.WriteBuffer(FGlobals.GetDataPointer()^, FGlobals.GetSize());
+    if LDataSection.Size = 0 then
+      LDataSection.WriteData(Byte(0));
+    AlignStream(LDataSection, 16);
+
+    //========================================================================
+    // STEP 2b: Separate static vs dynamic imports
+    //========================================================================
+    for LI := 0 to FImports.GetCount() - 1 do
+    begin
+      LEntry := FImports.GetEntryByIndex(LI);
       if LEntry.IsStatic then
       begin
+        // Static import -- resolve lib path from name
         LStaticImportIndices.Add(LI);
-        LStaticSymbolNames.Add(MachOStaticImportSymbolName(LEntry));
+        LStaticSymbolNames.Add(LEntry.FuncName);
+
+        // Build lib filename: append .a if no extension
         LLibPath := LEntry.DllName;
-        if TPath.GetExtension(LLibPath) = '' then
+        if ExtractFileExt(LLibPath) = '' then
           LLibPath := LLibPath + '.a';
+
+        // Resolve: absolute → use as-is; otherwise search FLibPaths then output dir
         if not TPath.IsPathRooted(LLibPath) then
         begin
           LResolvedPath := '';
           for LJ := 0 to FLibPaths.Count - 1 do
           begin
             LCandidate := TPath.Combine(FLibPaths[LJ], LLibPath);
-            if TFile.Exists(LCandidate) then
+            if FileExists(LCandidate) then
             begin
               LResolvedPath := LCandidate;
               Break;
             end;
           end;
+          // Fallback: relative to output directory
           if LResolvedPath = '' then
-            LResolvedPath := TPath.Combine(TPath.GetDirectoryName(FOutputPath), LLibPath);
+            LResolvedPath := TPath.Combine(ExtractFilePath(FOutputPath), LLibPath);
           LLibPath := LResolvedPath;
         end;
+
         LStaticLibPaths.Add(LLibPath);
         LHasStaticImports := True;
-      end;
-    end;
-
-    if LHasStaticImports then
-    begin
-      LLinker := TTigerMachOLinker.Create();
-      CopyStatusCallbackTo(LLinker);
-      for LI := 0 to LStaticLibPaths.Count - 1 do
+      end
+      else
       begin
-        if not TFile.Exists(LStaticLibPaths[LI]) then
-        begin
-          Status('Error: Static library not found: %s', [LStaticLibPaths[LI]]);
-          if Assigned(FErrors) then
-            FErrors.Add(esError, 'B050', 'Static library not found: %s', [LStaticLibPaths[LI]]);
-          Result := nil;
-          Exit;
-        end;
-        LLinker.AddLibraryFile(LStaticLibPaths[LI]);
+        // Dynamic import - add to dynamic list
+        LDynamicImportIndices.Add(LI);
       end;
-      LLinker.Resolve(LStaticSymbolNames);
-      if LLinker.GetUnresolvedSymbols().Count > 0 then
+    end;
+
+    // Recalculate import count (dynamic imports only)
+    LImportCount := LDynamicImportIndices.Count;
+    LHasImports := LImportCount > 0;
+
+    // Build mapping from original import index to PLT slot index
+    for LI := 0 to LDynamicImportIndices.Count - 1 do
+      LOrigToPltIndex.Add(LDynamicImportIndices[LI], LI);
+
+    //========================================================================
+    // STEP 2c: Build dynamic linking sections
+    // Required when: dynamic imports present OR building shared object
+    //========================================================================
+    if LHasImports or LIsSharedObject then
+    begin
+      //--------------------------------------------------------------------
+      // .interp -- dynamic linker path (not needed for shared objects)
+      //--------------------------------------------------------------------
+      if not LIsSharedObject then
       begin
-        Status('Error: Static linker unresolved symbols: %s', [LLinker.GetUnresolvedSymbols().CommaText]);
-        if Assigned(FErrors) then
-          FErrors.Add(esError, 'B051', 'Static linker unresolved symbols: %s', [LLinker.GetUnresolvedSymbols().CommaText]);
-        Result := nil;
-        Exit;
+        LDynstrPos := 0; // reuse as temp
+        LInterpSection.WriteBuffer(AnsiString('/lib/ld-linux-aarch64.so.1'#0)[1], 28);
       end;
-      LStaticResolved := LLinker.GetResolvedSymbols();
+
+      //--------------------------------------------------------------------
+      // .dynstr -- string table (null byte + symbol names + lib names)
+      //--------------------------------------------------------------------
+      LDynstrSection.WriteData(Byte(0));  // index 0 = empty string
+      LDynstrPos := 1;
+
+      // Import symbol names (dynamic imports only)
+      SetLength(LSymDynstrOffsets, LImportCount);
+      for LI := 0 to LImportCount - 1 do
+      begin
+        LOrigImportIndex := LDynamicImportIndices[LI];
+        LEntry := FImports.GetEntryByIndex(LOrigImportIndex);
+        LSymDynstrOffsets[LI] := LDynstrPos;
+        LDynstrSection.WriteBuffer(AnsiString(LEntry.FuncName + #0)[1],
+          Length(LEntry.FuncName) + 1);
+        Inc(LDynstrPos, Cardinal(Length(LEntry.FuncName)) + 1);
+      end;
+
+      // Export symbol names
+      SetLength(LExportDynstrOffsets, LNumExports);
+      for LI := 0 to LNumExports - 1 do
+      begin
+        LExportDynstrOffsets[LI] := LDynstrPos;
+        LDynstrSection.WriteBuffer(AnsiString(LExportFuncs[LI].Value + #0)[1],
+          Length(LExportFuncs[LI].Value) + 1);
+        Inc(LDynstrPos, Cardinal(Length(LExportFuncs[LI].Value)) + 1);
+      end;
+
+      // Library names (deduplicated, dynamic imports only)
+      for LI := 0 to LImportCount - 1 do
+      begin
+        LOrigImportIndex := LDynamicImportIndices[LI];
+        LEntry := FImports.GetEntryByIndex(LOrigImportIndex);
+        if LLibNames.IndexOf(LEntry.DllName) < 0 then
+          LLibNames.Add(LEntry.DllName);
+      end;
+      SetLength(LLibDynstrOffsets, LLibNames.Count);
+      for LI := 0 to LLibNames.Count - 1 do
+      begin
+        LLibDynstrOffsets[LI] := LDynstrPos;
+        LDynstrSection.WriteBuffer(AnsiString(LLibNames[LI] + #0)[1],
+          Length(LLibNames[LI]) + 1);
+        Inc(LDynstrPos, Cardinal(Length(LLibNames[LI])) + 1);
+      end;
+
+      // SONAME for shared objects
+      if LIsSharedObject and (LSoName <> '') then
+      begin
+        LSoNameDynstrOffset := LDynstrPos;
+        LDynstrSection.WriteBuffer(AnsiString(LSoName + #0)[1],
+          Length(LSoName) + 1);
+        Inc(LDynstrPos, Cardinal(Length(LSoName)) + 1);
+      end;
+
+      // Add $ORIGIN for RUNPATH (executables need to find .so in same directory)
+      if not LIsSharedObject then
+      begin
+        LRunpathDynstrOffset := LDynstrPos;
+        LDynstrSection.WriteBuffer(AnsiString('$ORIGIN' + #0)[1], 8);
+        Inc(LDynstrPos, 8);
+      end;
+
+      //--------------------------------------------------------------------
+      // .dynsym -- symbol table (STN_UNDEF + imports + exports)
+      //--------------------------------------------------------------------
+      // Entry 0: STN_UNDEF (24 bytes of zeros)
+      for LI := 0 to ELF64_SYM_SIZE - 1 do
+        LDynsymSection.WriteData(Byte(0));
+
+      // Import entries (st_shndx = 0 = SHN_UNDEF)
+      for LI := 0 to LImportCount - 1 do
+      begin
+        LDynsymSection.WriteData(LSymDynstrOffsets[LI]);         // st_name
+        LDynsymSection.WriteData(Byte((STB_GLOBAL shl 4) or STT_FUNC)); // st_info
+        LDynsymSection.WriteData(Byte(0));                       // st_other
+        LDynsymSection.WriteData(Word(0));                       // st_shndx = SHN_UNDEF
+        LDynsymSection.WriteData(UInt64(0));                     // st_value
+        LDynsymSection.WriteData(UInt64(0));                     // st_size
+      end;
+
+      // Export entries (st_shndx = 9 = .text section, st_value patched later)
+      for LI := 0 to LNumExports - 1 do
+      begin
+        LDynsymSection.WriteData(LExportDynstrOffsets[LI]);      // st_name
+        LDynsymSection.WriteData(Byte((STB_GLOBAL shl 4) or STT_FUNC)); // st_info
+        LDynsymSection.WriteData(Byte(0));                       // st_other
+        LDynsymSection.WriteData(Word(9));                       // st_shndx = .text section
+        LDynsymSection.WriteData(UInt64(0));                     // st_value (placeholder)
+        LDynsymSection.WriteData(UInt64(0));                     // st_size
+      end;
+
+      //--------------------------------------------------------------------
+      // .hash -- SysV hash table for symbol lookup
+      //--------------------------------------------------------------------
+      LNBuckets := Cardinal(LImportCount + LNumExports);
+      if LNBuckets = 0 then
+        LNBuckets := 1;
+      SetLength(LBuckets, LNBuckets);
+      SetLength(LChains, 1 + LImportCount + LNumExports);  // chain[0] = STN_UNDEF
+      for LI := 0 to High(LBuckets) do
+        LBuckets[LI] := 0;
+      for LI := 0 to High(LChains) do
+        LChains[LI] := 0;
+
+      // Build hash chains for imports: symbol indices are 1..LImportCount
+      for LI := 0 to LImportCount - 1 do
+      begin
+        LEntry := FImports.GetEntryByIndex(LI);
+        LHashVal := ElfHash(LEntry.FuncName) mod LNBuckets;
+        // Insert at head of bucket chain
+        LChains[LI + 1] := LBuckets[LHashVal];
+        LBuckets[LHashVal] := Cardinal(LI + 1);
+      end;
+
+      // Build hash chains for exports: symbol indices are (LImportCount+1)..(LImportCount+LNumExports)
+      for LI := 0 to LNumExports - 1 do
+      begin
+        LHashVal := ElfHash(LExportFuncs[LI].Value) mod LNBuckets;
+        // Insert at head of bucket chain
+        LChains[LImportCount + 1 + LI] := LBuckets[LHashVal];
+        LBuckets[LHashVal] := Cardinal(LImportCount + 1 + LI);
+      end;
+
+      LHashSection.WriteData(LNBuckets);                           // nbucket
+      LHashSection.WriteData(Cardinal(1 + LImportCount + LNumExports)); // nchain
+      for LI := 0 to High(LBuckets) do
+        LHashSection.WriteData(LBuckets[LI]);
+      for LI := 0 to High(LChains) do
+        LHashSection.WriteData(LChains[LI]);
+
+      //--------------------------------------------------------------------
+      // .rela.plt -- relocations (filled after offset calculation)
+      // .plt, .got.plt, .dynamic -- also deferred until offsets known
+      //--------------------------------------------------------------------
     end;
 
-    for LI := 0 to LImports.GetCount() - 1 do
+    //========================================================================
+    // STEP 3: Calculate section file offsets
+    //========================================================================
+    if LHasImports or LIsSharedObject then
     begin
-      LVal := 0;
-      LGotStream.WriteBuffer(LVal, 8);
+      // Shared objects: 4 headers (no PT_INTERP)
+      // Executables with imports: 5 headers (includes PT_INTERP)
+      if LIsSharedObject then
+        LPhdrCount := 4
+      else
+        LPhdrCount := 5;
+      LPhdrTableSize := Cardinal(LPhdrCount) * ELF64_PHDR_SIZE;
+
+      // .interp only for executables
+      if LIsSharedObject then
+      begin
+        LInterpFileOffset := 0;  // Not used
+        LHashFileOffset   := ELF64_EHDR_SIZE + LPhdrTableSize;
+      end
+      else
+      begin
+        LInterpFileOffset := ELF64_EHDR_SIZE + LPhdrTableSize;
+        LHashFileOffset   := LInterpFileOffset + Cardinal(LInterpSection.Size);
+      end;
+      // Align .hash to 8
+      if LHashFileOffset mod 8 <> 0 then
+        LHashFileOffset := LHashFileOffset + (8 - LHashFileOffset mod 8);
+      LDynsymFileOffset   := LHashFileOffset + Cardinal(LHashSection.Size);
+      // Align .dynsym to 8
+      if LDynsymFileOffset mod 8 <> 0 then
+        LDynsymFileOffset := LDynsymFileOffset + (8 - LDynsymFileOffset mod 8);
+      LDynstrFileOffset   := LDynsymFileOffset + Cardinal(LDynsymSection.Size);
+      LRelaPltFileOffset  := LDynstrFileOffset + Cardinal(LDynstrSection.Size);
+      // Align .rela.plt to 8
+      if LRelaPltFileOffset mod 8 <> 0 then
+        LRelaPltFileOffset := LRelaPltFileOffset + (8 - LRelaPltFileOffset mod 8);
+
+      // .rela.plt size = LImportCount * 24
+      LRoDataFileOffset := LRelaPltFileOffset + Cardinal(LImportCount) * ELF64_RELA_SIZE;
+      // Align .rodata to 16
+      if LRoDataFileOffset mod 16 <> 0 then
+        LRoDataFileOffset := LRoDataFileOffset + (16 - LRoDataFileOffset mod 16);
+      LDataFileOffset     := LRoDataFileOffset + Cardinal(LRoDataSection.Size);
+      // Align .data to 16
+      if LDataFileOffset mod 16 <> 0 then
+        LDataFileOffset := LDataFileOffset + (16 - LDataFileOffset mod 16);
+
+      // PLT: 32 bytes for PLT[0] + 16 bytes per import (AArch64)
+      LPltFileOffset := LDataFileOffset + Cardinal(LDataSection.Size);
+      // Align .plt to 16
+      if LPltFileOffset mod 16 <> 0 then
+        LPltFileOffset := LPltFileOffset + (16 - LPltFileOffset mod 16);
+
+      LTextFileOffset := LPltFileOffset + Cardinal(32 + LImportCount * 16);
+    end
+    else
+    begin
+      // No imports and not shared object -- original layout: 1 PHDR
+      LPhdrCount := 1;
+      LPhdrTableSize := ELF64_PHDR_SIZE;
+      LRoDataFileOffset := ELF64_EHDR_SIZE + LPhdrTableSize;
+      LDataFileOffset := LRoDataFileOffset + Cardinal(LRoDataSection.Size);
+      LTextFileOffset := LDataFileOffset + Cardinal(LDataSection.Size);
     end;
 
-    // Collect dynamic library dependencies (for LC_LOAD_DYLIB and bind ordinals).
-    // Always include libSystem on macOS.
-    LDylibNames.Add('/usr/lib/libSystem.B.dylib');
-    for LI := 0 to LImports.GetCount() - 1 do
-    begin
-      if LHasStaticImports and (LStaticImportIndices.IndexOf(LI) >= 0) then
-        Continue;
-      LEntry := LImports.GetEntryByIndex(LI);
-      LDylibName := NormalizeDylibName(LEntry.DllName);
-      if LDylibNames.IndexOf(LDylibName) < 0 then
-        LDylibNames.Add(LDylibName);
-    end;
-    for LI := 0 to LDylibNames.Count - 1 do
-      LDylibOrdinals.AddOrSetValue(LDylibNames[LI], LI + 1); // ordinals are 1-based
+    //========================================================================
+    // STEP 4: Generate code for each function (AArch64)
+    //========================================================================
+    SetLength(LFuncOffsets, FCode.GetFuncCount());
+    LMainIndex := -1;
+    LDllMainIndex := -1;
 
-    LCStringBytes := LData.GetData();
-    if Length(LCStringBytes) > 0 then
-      LCStringStream.WriteBuffer(LCStringBytes[0], Length(LCStringBytes));
-    LDataBytes := LGlobals.GetData();
-    if Length(LDataBytes) > 0 then
-      LDataStream.WriteBuffer(LDataBytes[0], Length(LDataBytes));
-
-    for LFuncIdx := 0 to LFuncCount - 1 do
+    for LI := 0 to FCode.GetFuncCount() - 1 do
     begin
-      LFunc := LCode.GetFunc(LFuncIdx);
-      LFuncOffsets.Add(LFuncIdx, Cardinal(LTextStream.Position));
+      LFunc := FCode.GetFunc(LI);
+      LFuncOffsets[LI] := LTextSection.Size;
+
+      if LFunc.IsEntryPoint then
+        LMainIndex := LI;
+      if LFunc.IsDllEntry then
+        LDllMainIndex := LI;
+
+      SetLength(LLabelOffsets, Length(LFunc.Labels));
+      for LJ := 0 to High(LLabelOffsets) do
+        LLabelOffsets[LJ] := 0;
 
       // Reserve a fixed spill area under FP for x0-x7, even if unused.
       // This must match the offset scheme in GetParamOffset/GetLocalOffset/GetTempOffset
@@ -1491,18 +1360,18 @@ begin
       LIncomingSpillSize := Cardinal(SpillBaseSize());
 
       LLocalsSize := 0;
-      for LI := 0 to High(LFunc.Locals) do
-        LLocalsSize := LLocalsSize + Cardinal(LFunc.Locals[LI].LocalSize);
+      for LJ := 0 to High(LFunc.Locals) do
+        LLocalsSize := LLocalsSize + Cardinal(LFunc.Locals[LJ].LocalSize);
       LMaxCallArgs := 0;
-      for LI := 0 to High(LFunc.Instructions) do
-        if LFunc.Instructions[LI].Kind in [ikCallImport, ikCall, ikCallIndirect] then
-          if Length(LFunc.Instructions[LI].Args) > Integer(LMaxCallArgs) then
-            LMaxCallArgs := Length(LFunc.Instructions[LI].Args);
+      for LJ := 0 to High(LFunc.Instructions) do
+        if LFunc.Instructions[LJ].Kind in [ikCallImport, ikCall, ikCallIndirect] then
+          if Length(LFunc.Instructions[LJ].Args) > Integer(LMaxCallArgs) then
+            LMaxCallArgs := Length(LFunc.Instructions[LJ].Args);
       if LMaxCallArgs > 8 then
         LOutgoingArgSpace := LMaxCallArgs * 8
       else
         LOutgoingArgSpace := 64;
-      LExceptFrameSize := Cardinal(Length(LFunc.ExceptionScopes)) * MACOS64_EXCEPT_FRAME_SIZE;
+      LExceptFrameSize := Cardinal(Length(LFunc.ExceptionScopes)) * LINUXARM64_EXCEPT_FRAME_SIZE;
       LExceptFrameBaseOffset := LIncomingSpillSize + LLocalsSize + Cardinal(LFunc.TempCount) * 8 + LOutgoingArgSpace;
       if LExceptFrameSize > 0 then
       begin
@@ -1552,18 +1421,18 @@ begin
       else
       begin
         // Non-variadic: save declared params only
-        for LI := 0 to Min(Length(LFunc.Params) - 1, 7) do
-          EmitStrFp(GetParamOffset(LI), LI);
+        for LK := 0 to Min(Length(LFunc.Params) - 1, 7) do
+          EmitStrFp(GetParamOffset(LK), LK);
       end;
 
-      if (not SEH_EMIT_DISABLED) and LFunc.IsEntryPoint and LHasSEH and (LInitExceptionsIdx >= 0) then
+      if LFunc.IsEntryPoint and LHasSEH and (LInitExceptionsIdx >= 0) then
       begin
-        LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LInitExceptionsIdx));
+        LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInitExceptionsIdx));
         EmitBL(0);
       end;
-      if (not SEH_EMIT_DISABLED) and LFunc.IsEntryPoint and LHasSEH and (LInitSignalsIdx >= 0) then
+      if LFunc.IsEntryPoint and LHasSEH and (LInitSignalsIdx >= 0) then
       begin
-        LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LInitSignalsIdx));
+        LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInitSignalsIdx));
         EmitBL(0);
       end;
 
@@ -1589,45 +1458,18 @@ begin
         case LInstr.Kind of
           ikCallImport:
             begin
-              LEntry := LImports.GetEntryByIndex(LInstr.ImportTarget.Index);
-              if LEntry.IsVariadic and (Length(LInstr.Args) > 0) then
+              for LK := 0 to High(LInstr.Args) do
               begin
-                // macOS ARM64 (Darwin) variadic calling convention (as emitted by clang):
-                // - Fixed args are passed in registers as usual.
-                // - Variadic args are passed on the stack starting at [SP].
-                //
-                // For printf(const char* fmt, ...):
-                // - fmt goes in x0
-                // - all variadic args go at [SP + 0], [SP + 8], ...
-                //
-                // IMPORTANT: Do NOT adjust SP here. Our stack frame already reserves
-                // outgoing arg space (LOutgoingArgSpace) at the bottom of the frame.
-                LoadOperandToReg(LInstr.Args[0], REG_X0);
-                for LK := 1 to Length(LInstr.Args) - 1 do
+                if LK < LINUXARM64_MAX_REG_ARGS then
+                  LoadOperandToReg(LInstr.Args[LK], LINUXARM64_ARG_REGS[LK])
+                else
                 begin
                   LoadOperandToReg(LInstr.Args[LK], REG_X16);
-                  EmitStrX(REG_X16, REG_SP, Cardinal((LK - 1) * 8));
+                  EmitStrX(REG_X16, REG_SP, Cardinal((LK - LINUXARM64_MAX_REG_ARGS) * 8));
                 end;
-              end
-              else
-              begin
-                // Non-variadic (or no-arg) call: pass first 8 args in x0-x7.
-                for LK := 0 to Min(Length(LInstr.Args) - 1, 7) do
-                  LoadOperandToReg(LInstr.Args[LK], LK);
-                // Overflow args for non-variadic are not currently supported on macOS backend.
               end;
-              if LHasStaticImports and (LStaticImportIndices.IndexOf(LInstr.ImportTarget.Index) >= 0) then
-              begin
-                EmitBL(0);
-                LStaticCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position) - 4, LInstr.ImportTarget.Index));
-              end
-              else
-              begin
-                LImportFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LInstr.ImportTarget.Index));
-                EmitAdrp(REG_X16, 0);
-                EmitARM64($F9400000 or (0 shl 10) or (REG_X16 shl 5) or REG_X16);
-                EmitBLR(REG_X16);
-              end;
+              LPltFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.ImportTarget.Index));
+              EmitBL(0);
               if LInstr.Dest.IsValid() then
                 StoreTempFromReg(LInstr.Dest.Index, REG_X0);
             end;
@@ -1635,7 +1477,7 @@ begin
             begin
               for LK := 0 to Min(Length(LInstr.Args) - 1, 7) do
                 LoadOperandToReg(LInstr.Args[LK], LK);
-              LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LInstr.FuncTarget.Index));
+              LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.FuncTarget.Index));
               EmitBL(0);
               if LInstr.Dest.IsValid() then
                 StoreTempFromReg(LInstr.Dest.Index, REG_X0);
@@ -1717,13 +1559,13 @@ begin
             begin
               LoadOperandToReg(LInstr.Op1, REG_X0);
               LoadOperandToReg(LInstr.Op2, REG_X16);
-              if LHasSEH and (LRaiseCodeIdx >= 0) then
+              if False then
               begin
                 EmitARM64($F1000000 or (REG_X16 shl 5) or 31);
                 EmitARM64($54000061 or ((3 and $7FFFF) shl 5));
                 EmitMovX(REG_X0, 42);
                 EmitMovX(REG_X1, 0);
-                LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LRaiseCodeIdx));
+                LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LRaiseCodeIdx));
                 EmitBL(0);
               end;
               EmitARM64($9BC07C00 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
@@ -1733,13 +1575,13 @@ begin
             begin
               LoadOperandToReg(LInstr.Op1, REG_X0);
               LoadOperandToReg(LInstr.Op2, REG_X16);
-              if LHasSEH and (LRaiseCodeIdx >= 0) then
+              if False then
               begin
                 EmitARM64($F1000000 or (REG_X16 shl 5) or 31);
                 EmitARM64($54000061 or ((3 and $7FFFF) shl 5));
                 EmitMovX(REG_X0, 42);
                 EmitMovX(REG_X1, 0);
-                LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LRaiseCodeIdx));
+                LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LRaiseCodeIdx));
                 EmitBL(0);
               end;
               EmitARM64($AA0003E0 or (REG_X0 shl 5) or REG_X17);
@@ -1914,15 +1756,15 @@ begin
           ikLabel:
             if LInstr.LabelTarget.IsValid() then
             begin
-              LLabelOffsets.AddOrSetValue((LFuncIdx shl 16) or LInstr.LabelTarget.Index, Cardinal(LTextStream.Position));
+              LLabelOffsets[LInstr.LabelTarget.Index] := LTextSection.Size;
 
-              if (not SEH_EMIT_DISABLED) and LTryBeginLabels.TryGetValue(LInstr.LabelTarget.Index, LScopeIdx) then
+              if LTryBeginLabels.TryGetValue(LInstr.LabelTarget.Index, LScopeIdx) then
               begin
                 if LPushExceptFrameIdx < 0 then
                   raise Exception.Create('Tiger_PushExceptFrame not found - exception handling runtime not linked');
                 if LSigsetjmpIdx < 0 then
                   raise Exception.Create('sigsetjmp not imported - exception handling runtime not linked');
-                LFrameOffset := LExceptFrameBaseOffset + Cardinal(LScopeIdx) * MACOS64_EXCEPT_FRAME_SIZE;
+                LFrameOffset := LExceptFrameBaseOffset + Cardinal(LScopeIdx) * LINUXARM64_EXCEPT_FRAME_SIZE;
                 if LFrameOffset <= 4095 then
                   EmitSubImm(REG_X0, REG_FP, LFrameOffset)
                 else
@@ -1930,7 +1772,7 @@ begin
                   EmitMovRegImm64(REG_X16, LFrameOffset);
                   EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X0);
                 end;
-                LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LPushExceptFrameIdx));
+                LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LPushExceptFrameIdx));
                 EmitBL(0);
                 if LFrameOffset + 8 <= 4095 then
                   EmitSubImm(REG_X0, REG_FP, LFrameOffset - 8)
@@ -1940,18 +1782,8 @@ begin
                   EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X0);
                 end;
                 EmitMovX(REG_X1, 0);
-                if LHasStaticImports and (LStaticImportIndices.IndexOf(LSigsetjmpIdx) >= 0) then
-                begin
-                  EmitBL(0);
-                  LStaticCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position) - 4, LSigsetjmpIdx));
-                end
-                else
-                begin
-                  LImportFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LSigsetjmpIdx));
-                  EmitAdrp(REG_X16, 0);
-                  EmitARM64($F9400000 or (0 shl 10) or (REG_X16 shl 5) or REG_X16);
-                  EmitBLR(REG_X16);
-                end;
+                LPltFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LSigsetjmpIdx));
+                EmitBL(0);
                 if LFunc.ExceptionScopes[LScopeIdx].ExceptLabel.IsValid() then
                   LExceptLabelIdx := LFunc.ExceptionScopes[LScopeIdx].ExceptLabel.Index
                 else if LFunc.ExceptionScopes[LScopeIdx].FinallyLabel.IsValid() then
@@ -1960,66 +1792,57 @@ begin
                   LExceptLabelIdx := -1;
                 if LExceptLabelIdx >= 0 then
                 begin
-                  LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), (LFuncIdx shl 16) or LExceptLabelIdx));
+                  LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LExceptLabelIdx));
                   EmitARM64($35000000);
                 end;
               end;
 
-              if (not SEH_EMIT_DISABLED) and LEndLabels.TryGetValue(LInstr.LabelTarget.Index, LScopeIdx) then
+              if LEndLabels.TryGetValue(LInstr.LabelTarget.Index, LScopeIdx) then
               begin
                 if LPopExceptFrameIdx < 0 then
                   raise Exception.Create('Tiger_PopExceptFrame not found - exception handling runtime not linked');
-                LCallFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), LPopExceptFrameIdx));
+                LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LPopExceptFrameIdx));
                 EmitBL(0);
               end;
             end;
           ikJump:
             if LInstr.LabelTarget.IsValid() then
             begin
-              LJumpFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), (LFuncIdx shl 16) or LInstr.LabelTarget.Index));
+              LJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.LabelTarget.Index));
               EmitARM64($14000000);
             end;
           ikJumpIf:
             if LInstr.LabelTarget.IsValid() then
             begin
               LoadOperandToReg(LInstr.Op1, REG_X0);
-              LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), (LFuncIdx shl 16) or LInstr.LabelTarget.Index));
+              LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.LabelTarget.Index));
               EmitARM64($35000000);
             end;
           ikJumpIfNot:
             if LInstr.LabelTarget.IsValid() then
             begin
               LoadOperandToReg(LInstr.Op1, REG_X0);
-              LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(Cardinal(LTextStream.Position), (LFuncIdx shl 16) or LInstr.LabelTarget.Index));
+              LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.LabelTarget.Index));
               EmitARM64($34000000);
             end;
           ikNop:
             ;
           ikSyscall:
             begin
-              // macOS ARM64: x16 = syscall number, x0-x5 = args, SVC #0x80, return in x0
-              // Map Linux x86_64 syscall numbers to Darwin so Syscall(60, [code]) and Syscall(1, [fd,buf,len]) work
-              if Length(LInstr.Args) > 0 then
-                LoadOperandToReg(LInstr.Args[0], REG_X0);
-              if Length(LInstr.Args) > 1 then
-                LoadOperandToReg(LInstr.Args[1], REG_X1);
-              if Length(LInstr.Args) > 2 then
-                LoadOperandToReg(LInstr.Args[2], REG_X2);
-              if Length(LInstr.Args) > 3 then
-                LoadOperandToReg(LInstr.Args[3], REG_X3);
-              if Length(LInstr.Args) > 4 then
-                LoadOperandToReg(LInstr.Args[4], REG_X4);
-              if Length(LInstr.Args) > 5 then
-                LoadOperandToReg(LInstr.Args[5], REG_X5);
+              if Length(LInstr.Args) > 0 then LoadOperandToReg(LInstr.Args[0], REG_X0);
+              if Length(LInstr.Args) > 1 then LoadOperandToReg(LInstr.Args[1], REG_X1);
+              if Length(LInstr.Args) > 2 then LoadOperandToReg(LInstr.Args[2], REG_X2);
+              if Length(LInstr.Args) > 3 then LoadOperandToReg(LInstr.Args[3], REG_X3);
+              if Length(LInstr.Args) > 4 then LoadOperandToReg(LInstr.Args[4], REG_X4);
+              if Length(LInstr.Args) > 5 then LoadOperandToReg(LInstr.Args[5], REG_X5);
               case LInstr.SyscallNr of
-                LINUX_SYS_READ:  EmitMovRegImm64(REG_X16, DARWIN_SYS_READ);
-                LINUX_SYS_WRITE: EmitMovRegImm64(REG_X16, DARWIN_SYS_WRITE);
-                LINUX_SYS_EXIT:  EmitMovRegImm64(REG_X16, DARWIN_SYS_EXIT);
+                LINUXARM64_SYS_READ_X64:  EmitMovRegImm64(REG_X8, LINUXARM64_SYS_READ);
+                LINUXARM64_SYS_WRITE_X64: EmitMovRegImm64(REG_X8, LINUXARM64_SYS_WRITE);
+                LINUXARM64_SYS_EXIT_X64:  EmitMovRegImm64(REG_X8, LINUXARM64_SYS_EXIT);
               else
-                EmitMovRegImm64(REG_X16, Cardinal(LInstr.SyscallNr));
+                EmitMovRegImm64(REG_X8, Cardinal(LInstr.SyscallNr));
               end;
-              // SVC #0x80 — encoding: 11010100 000imm16 00001 -> 0xD4001001 for imm=0x80
-              EmitARM64($D4001001);
+              EmitARM64($D4000001);
               if LInstr.Dest.IsValid() then
                 StoreTempFromReg(LInstr.Dest.Index, REG_X0);
             end;
@@ -2070,7 +1893,7 @@ begin
               
               // B.GE to stack args path (branch if position >= 8)
               // B.cond encoding: [31:24]=0x54, [23:20]=cond (GE=0x0A), [19:5]=imm19, [4:0]=0x1E
-              var LBranchOffset := Cardinal(LTextStream.Position);
+              var LBranchOffset := LTextSection.Size;
               EmitARM64($540A001E);  // B.GE (placeholder offset=0, will be patched)
               
               // === Register arg path: [FP - (8 + pos * 8)] ===
@@ -2079,13 +1902,13 @@ begin
               EmitLdrX(REG_X0, REG_X16, 0);                      // LDR X0, [X16]
               
               // Jump over stack path
-              var LSkipOffset := Cardinal(LTextStream.Position);
+              var LSkipOffset := LTextSection.Size;
               EmitARM64($14000000);  // B (placeholder, will be patched)
               
               // === Stack arg path: [FP + 16 + (pos - 8) * 8] ===
               // Position 8 → [FP+16], Position 9 → [FP+24], etc.
               // Restore position from X17
-              var LStackPathStart := Cardinal(LTextStream.Position);
+              var LStackPathStart := LTextSection.Size;
               EmitARM64($AA1103E0 or (REG_X17 shl 5) or REG_X0);  // MOV X0, X17
               EmitARM64($D37EF400 or (REG_X0 shl 5) or REG_X0);    // LSL X0, X0, #3 (pos * 8)
               EmitSubImm(REG_X0, REG_X0, 64);                      // X0 = (pos-8)*8
@@ -2095,9 +1918,9 @@ begin
               
               // Track forward jumps for patching after LTextBytes is created
               var LRegisterPathSize := LStackPathStart - LBranchOffset - 4;  // Size of register path in bytes
-              var LStackPathSize := Cardinal(LTextStream.Position) - LStackPathStart;  // Size of stack path in bytes
+              var LStackPathSize := LTextSection.Size - LStackPathStart;  // Size of stack path in bytes
               LForwardJumpFixups.Add(TPair<Cardinal, Cardinal>.Create(LBranchOffset, LStackPathStart));
-              LForwardJumpFixups.Add(TPair<Cardinal, Cardinal>.Create(LSkipOffset, Cardinal(LTextStream.Position)));
+              LForwardJumpFixups.Add(TPair<Cardinal, Cardinal>.Create(LSkipOffset, LTextSection.Size));
               
               // Store result
               StoreTempFromReg(LInstr.Dest.Index, REG_X0);
@@ -2106,1278 +1929,2388 @@ begin
           ;
         end;
       end;
-    end;
 
-    SetLength(LTextBytes, LTextStream.Size);
-    if LTextStream.Size > 0 then
-    begin
-      LTextStream.Position := 0;
-      LTextStream.ReadBuffer(LTextBytes[0], LTextStream.Size);
-    end;
+      if Length(LFunc.Instructions) > 0 then
+      begin
+        if not (LFunc.Instructions[High(LFunc.Instructions)].Kind in [ikReturn, ikReturnValue]) then
+        begin
+          if LStackFrameSize > 0 then
+            EmitAddImm(REG_SP, REG_SP, LStackFrameSize);
+          EmitLdpPost(REG_FP, REG_LR, REG_SP, 16);
+          EmitRet();
+        end;
+      end
+      else
+      begin
+        if LStackFrameSize > 0 then
+          EmitAddImm(REG_SP, REG_SP, LStackFrameSize);
+        EmitLdpPost(REG_FP, REG_LR, REG_SP, 16);
+        EmitRet();
+      end;
 
-    if LHasStaticImports and (LLinker <> nil) then
+      for LJ := 0 to LJumpFixups.Count - 1 do
+        PatchUncondBranch(LJumpFixups[LJ].Key, LLabelOffsets[LJumpFixups[LJ].Value]);
+      for LJ := 0 to LCondJumpFixups.Count - 1 do
+        PatchCondBranch(LCondJumpFixups[LJ].Key, LLabelOffsets[LCondJumpFixups[LJ].Value]);
+      for LJ := 0 to LForwardJumpFixups.Count - 1 do
+      begin
+        LTextSection.Position := LForwardJumpFixups[LJ].Key;
+        LTextSection.ReadData(LInsn, 4);
+        if (LInsn and $FF000000) = $54000000 then
+          PatchCondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value)
+        else
+          PatchUncondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value);
+      end;
+      LJumpFixups.Clear();
+      LCondJumpFixups.Clear();
+      LForwardJumpFixups.Clear();
+
+      AlignStream(LTextSection, 16);
+    end;
+    // STEP 4b: Static linking - resolve symbols from .a archives
+    //========================================================================
+    if LHasStaticImports then
     begin
-      LExternalTextBase := Length(LTextBytes);
+      LLinker := TTigerELFLinker.Create();
+      CopyStatusCallbackTo(LLinker);
+
+      // Add library files from imports
+      for LI := 0 to LStaticLibPaths.Count - 1 do
+        LLinker.AddLibraryFile(LStaticLibPaths[LI]);
+
+      // Resolve needed symbols
+      LLinker.Resolve(LStaticSymbolNames);
+
+      // Align .text to 16 bytes before appending external code
+      AlignStream(LTextSection, 16);
+      LExternalTextBase := Cardinal(LTextSection.Size);
+
+      // Append merged .text from static libraries
       LMergedBytes := LLinker.GetMergedText();
+      if Length(LMergedBytes) >= 8 then
       if Length(LMergedBytes) > 0 then
+        LTextSection.WriteBuffer(LMergedBytes[0], Length(LMergedBytes));
+      AlignStream(LTextSection, 16);
+
+      // Build static import resolution map: original import index -> offset in LTextSection
+      LStaticResolved := LLinker.GetResolvedSymbols();
+      for LI := 0 to LStaticImportIndices.Count - 1 do
       begin
-        SetLength(LTextBytes, Length(LTextBytes) + Length(LMergedBytes));
-        Move(LMergedBytes[0], LTextBytes[LExternalTextBase], Length(LMergedBytes));
+        LImportIndex := LStaticImportIndices[LI];
+        LStaticFuncName := LStaticSymbolNames[LI];
+        if LStaticResolved.TryGetValue(LStaticFuncName, LResolvedSym) then
+        begin
+          if LResolvedSym.SectionKind = lskText then
+            LStaticImportResolved.Add(LImportIndex,
+              LExternalTextBase + LResolvedSym.OffsetInMerged);
+        end;
       end;
-      for LI := 0 to LStaticCallFixups.Count - 1 do
-      begin
-        for LJ := 0 to LStaticImportIndices.Count - 1 do
-          if LStaticImportIndices[LJ] = LStaticCallFixups[LI].Value then
-          begin
-            if LStaticResolved.TryGetValue(LStaticSymbolNames[LJ], LResolvedSym) and
-               (LResolvedSym.SectionKind = lskText) then
-            begin
-              if (LStaticCallFixups[LI].Key + 4 <= Cardinal(Length(LTextBytes))) then
-              begin
-                // AArch64 BL immediate is relative to the *address of the branch
-                // instruction itself* (unlike some 32-bit ARM modes). Do NOT
-                // subtract 4 here, or we'll land one instruction early (often
-                // the preceding function's RET).
-                LInstrIdx := (Int64(LExternalTextBase) + Int64(LResolvedSym.OffsetInMerged) - Int64(LStaticCallFixups[LI].Key)) div 4;
-                if (LInstrIdx >= -33554432) and (LInstrIdx <= 33554431) then
-                  PCardinal(@LTextBytes[LStaticCallFixups[LI].Key])^ := $94000000 or (Cardinal(LInstrIdx) and $3FFFFFF);
-              end;
-            end;
-            Break;
-          end;
-      end;
-      Status('Static linker: %d symbols resolved, external .text at offset %d',
-        [LStaticResolved.Count, LExternalTextBase]);
+
+      Status('Static linker: %d/%d symbols resolved, external .text at offset %d',
+        [LStaticImportResolved.Count, LStaticImportIndices.Count, LExternalTextBase]);
     end;
 
+    //========================================================================
+    // STEP 5: Backpatch cross-function calls (BL)
     for LI := 0 to LCallFixups.Count - 1 do
-    begin
-      LK := LCallFixups[LI].Value;
-      if LFuncOffsets.ContainsKey(LK) then
-      begin
-        if (LCallFixups[LI].Key + 4 <= Cardinal(Length(LTextBytes))) then
-        begin
-          LInstrIdx := Integer(Int64(LFuncOffsets[LK]) - Int64(LCallFixups[LI].Key));
-          LInstrIdx := LInstrIdx div 4;  // Signed division; shr 2 is wrong for negative (logical shift)
-          if (LInstrIdx >= -33554432) and (LInstrIdx <= 33554431) then
-            PCardinal(@LTextBytes[LCallFixups[LI].Key])^ := $94000000 or (Cardinal(LInstrIdx) and $3FFFFFF);
-        end;
-      end;
-    end;
+      PatchBL(LCallFixups[LI].Key, LFuncOffsets[LCallFixups[LI].Value]);
+    LTextSection.Position := LTextSection.Size;
 
-    for LI := 0 to LJumpFixups.Count - 1 do
-    begin
-      if LLabelOffsets.TryGetValue(LJumpFixups[LI].Value, LLabelOffset) then
-      begin
-        if (LJumpFixups[LI].Key + 4 <= Cardinal(Length(LTextBytes))) then
-        begin
-          LInstrIdx := Integer(Int64(LLabelOffset) - Int64(LJumpFixups[LI].Key));
-          LInstrIdx := LInstrIdx div 4;  // Signed division for backward branches
-          if (LInstrIdx >= -33554432) and (LInstrIdx <= 33554431) then
-            PCardinal(@LTextBytes[LJumpFixups[LI].Key])^ := $14000000 or (Cardinal(LInstrIdx) and $3FFFFFF);
-        end;
-      end;
-    end;
-
-    for LI := 0 to LCondJumpFixups.Count - 1 do
-    begin
-      if LCondJumpFixups[LI].Value >= 0 then  // Valid label index
-      begin
-        if LLabelOffsets.TryGetValue(LCondJumpFixups[LI].Value, LLabelOffset) then
-        begin
-          if (LCondJumpFixups[LI].Key + 4 <= Cardinal(Length(LTextBytes))) then
-          begin
-            LInstrIdx := Integer(Int64(LLabelOffset) - Int64(LCondJumpFixups[LI].Key));
-            LInstrIdx := LInstrIdx div 4;  // Signed division for backward branches
-            if (LInstrIdx >= -262144) and (LInstrIdx <= 262143) then
-              PCardinal(@LTextBytes[LCondJumpFixups[LI].Key])^ := (PCardinal(@LTextBytes[LCondJumpFixups[LI].Key])^ and $FF00001F) or ((Cardinal(LInstrIdx) and $7FFFF) shl 5);
-          end;
-        end;
-      end;
-    end;
-
-    // Patch forward jumps (for ikVaArgAt)
-    for LI := 0 to LForwardJumpFixups.Count - 1 do
-    begin
-      if (LForwardJumpFixups[LI].Key + 4 <= Cardinal(Length(LTextBytes))) and
-         (LForwardJumpFixups[LI].Value <= Cardinal(Length(LTextBytes))) then
-      begin
-        LInstrIdx := Integer(Int64(LForwardJumpFixups[LI].Value) - Int64(LForwardJumpFixups[LI].Key));
-        LInstrIdx := LInstrIdx div 4;  // Convert to instruction offset
-        if (LInstrIdx >= -262144) and (LInstrIdx <= 262143) then
-        begin
-          // Check if it's a conditional branch (B.GE) or unconditional (B)
-          var LIn := PCardinal(@LTextBytes[LForwardJumpFixups[LI].Key])^;
-          if (LIn and $FF000000) = $54000000 then
-            // Conditional branch: preserve condition and opcode bits [31:20] and [4:0], update offset [19:5]
-            PCardinal(@LTextBytes[LForwardJumpFixups[LI].Key])^ := (LIn and $FFF0001F) or ((Cardinal(LInstrIdx) and $7FFFF) shl 5)
-          else if (LIn and $FC000000) = $14000000 then
-            // Unconditional branch: update offset
-            PCardinal(@LTextBytes[LForwardJumpFixups[LI].Key])^ := $14000000 or (Cardinal(LInstrIdx) and $3FFFFFF);
-        end;
-      end;
-    end;
-
-    // -------------------------------------------------------------------------
-    // Compute canonical Mach-O layout needed for ADRP-based fixups.
-    // Must use the same alignment (SEGMENT_PAGE_SIZE) as the emitted binary
-    // or GOT/data addresses patched into code will be wrong and the program
-    // will jump to 0 or crash.
-    // -------------------------------------------------------------------------
-    LSegTextFileOff := 0;
-    LTextSectionFileOff := PAGE_SIZE;
-    LSegTextFileSize := (Length(LTextBytes) + Length(LCStringBytes) + 15) and (not 15);
-    LTextMapSize := AlignUp32(LTextSectionFileOff + LSegTextFileSize, SEGMENT_PAGE_SIZE);
-    LSegDataFileOff := LTextMapSize;
-    LSlide := SEG_TEXT_VADDR; // since __TEXT.fileoff = 0
-
-    LGotStartOffset := (Length(LDataBytes) + 7) and (not 7);
-    for LI := 0 to LImportFixups.Count - 1 do
-    begin
-      // GOT lives in __DATA after globals; align to 8 so LDR Xt,[Xn,#imm] reads correct slot.
-      LSlotAddr := LSlide + UInt64(LSegDataFileOff) + UInt64(LGotStartOffset) + UInt64(LImportFixups[LI].Value) * 8;
-      LPageIndex := (Int64(LSlotAddr) shr 12) - (Int64(LSlide + UInt64(LTextSectionFileOff) + UInt64(LImportFixups[LI].Key)) shr 12);
-      LOfs12 := (LSlotAddr and $FFF) div 8;
-      if (LPageIndex >= -1048576) and (LPageIndex <= 1048575) and
-         (LImportFixups[LI].Key + 8 <= Cardinal(Length(LTextBytes))) then
-      begin
-        LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
-        PCardinal(@LTextBytes[LImportFixups[LI].Key])^ := $90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5);
-        PCardinal(@LTextBytes[LImportFixups[LI].Key + 4])^ := $F9400000 or (LOfs12 shl 10) or (REG_X16 shl 5) or REG_X16;
-      end;
-    end;
-
+    // STEP 6: Backpatch .rodata (ADRP+ADD)
     for LI := 0 to LDataFixups.Count - 1 do
     begin
       LTargetIndex := LDataFixups[LI].Value shr 8;
       LTargetReg := Byte(LDataFixups[LI].Value and $FF);
-      if (LTargetIndex >= 0) then
-      begin
-        LDataHandle.Index := LTargetIndex;
-        // C-strings are placed after .text in the __TEXT mapping.
-        LSlotAddr := LSlide + UInt64(LTextSectionFileOff) + UInt64(Length(LTextBytes)) + UInt64(LData.GetEntry(LDataHandle).Offset);
-        LPageIndex := (Int64(LSlotAddr) shr 12) - (Int64(LSlide + UInt64(LTextSectionFileOff) + UInt64(LDataFixups[LI].Key)) shr 12);
-        LOfs12 := LSlotAddr and $FFF;
-        if (LPageIndex >= -1048576) and (LPageIndex <= 1048575) and
-           (LDataFixups[LI].Key + 8 <= Cardinal(Length(LTextBytes))) then
-        begin
-          LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
-          PCardinal(@LTextBytes[LDataFixups[LI].Key])^ := $90000000 or LTargetReg or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5);
-          PCardinal(@LTextBytes[LDataFixups[LI].Key + 4])^ := $91000000 or (LOfs12 shl 10) or (Cardinal(LTargetReg) shl 5) or LTargetReg;
-        end;
-      end;
+      LDataHandle.Index := LTargetIndex;
+      LDataEntryRec := FData.GetEntry(LDataHandle);
+      PatchAdrpAdd(LDataFixups[LI].Key, BASE_VADDR + LRoDataFileOffset + LDataEntryRec.Offset, LTargetReg);
     end;
 
+    // STEP 7: Backpatch .data (ADRP+ADD) and global page bases
     for LI := 0 to LGlobalFixups.Count - 1 do
     begin
       LTargetIndex := LGlobalFixups[LI].Value shr 8;
       LTargetReg := Byte(LGlobalFixups[LI].Value and $FF);
-      if (LTargetIndex >= 0) then
-      begin
-        LDataHandle.Index := LTargetIndex;
-        LSlotAddr := LSlide + UInt64(LSegDataFileOff) + UInt64(LGlobals.GetEntry(LDataHandle).Offset);
-        LPageIndex := (Int64(LSlotAddr) shr 12) - (Int64(LSlide + UInt64(LTextSectionFileOff) + UInt64(LGlobalFixups[LI].Key)) shr 12);
-        LOfs12 := LSlotAddr and $FFF;
-        if (LPageIndex >= -1048576) and (LPageIndex <= 1048575) and
-           (LGlobalFixups[LI].Key + 8 <= Cardinal(Length(LTextBytes))) then
-        begin
-          LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
-          PCardinal(@LTextBytes[LGlobalFixups[LI].Key])^ := $90000000 or LTargetReg or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5);
-          PCardinal(@LTextBytes[LGlobalFixups[LI].Key + 4])^ := $91000000 or (LOfs12 shl 10) or (Cardinal(LTargetReg) shl 5) or LTargetReg;
-        end;
-      end;
+      LDataHandle.Index := LTargetIndex;
+      LDataEntryRec := FGlobals.GetEntry(LDataHandle);
+      PatchAdrpAdd(LGlobalFixups[LI].Key, BASE_VADDR + LDataFileOffset + LDataEntryRec.Offset, LTargetReg);
     end;
-
     for LI := 0 to LDataPageFixups.Count - 1 do
     begin
-      LSlotAddr := LSlide + UInt64(LSegDataFileOff);
-      LPageIndex := (Int64(LSlotAddr) shr 12) - (Int64(LSlide + UInt64(LTextSectionFileOff) + UInt64(LDataPageFixups[LI])) shr 12);
-      if (LPageIndex >= -1048576) and (LPageIndex <= 1048575) and
-         (LDataPageFixups[LI] + 4 <= Cardinal(Length(LTextBytes))) then
-      begin
-        LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
-        PCardinal(@LTextBytes[LDataPageFixups[LI]])^ := $90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5);
-      end;
+      LPageIndex := Int64((BASE_VADDR + LDataFileOffset) shr 12) -
+                    Int64((BASE_VADDR + LTextFileOffset + LDataPageFixups[LI]) shr 12);
+      LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
+      LTextSection.Position := LDataPageFixups[LI];
+      LTextSection.WriteData($90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5));
     end;
 
+    // STEP 8: Backpatch @func addresses
     for LI := 0 to LFuncAddrFixups.Count - 1 do
     begin
-      LByteOffset := LFuncAddrFixups[LI].Key;
-      LJ := LFuncAddrFixups[LI].Value;
-      LCardVal := Cardinal(LJ and $FF);
-      LJ := LJ shr 8;
-      if (LJ >= 0) and (LJ < LFuncCount) and (LFuncAddrFixups[LI].Key + 8 <= Cardinal(Length(LTextBytes))) then
+      LJ := LFuncAddrFixups[LI].Value shr 8;
+      LTargetReg := Byte(LFuncAddrFixups[LI].Value and $FF);
+      PatchAdrpAdd(LFuncAddrFixups[LI].Key, BASE_VADDR + LTextFileOffset + LFuncOffsets[LJ], LTargetReg);
+    end;
+
+    // STEP 8b: Backpatch PLT/static import BLs
+    for LI := 0 to LPltFixups.Count - 1 do
+    begin
+      if LStaticImportResolved.TryGetValue(LPltFixups[LI].Value, LTargetOffset) then
+        PatchBL(LPltFixups[LI].Key, LTargetOffset)
+      else if LOrigToPltIndex.TryGetValue(LPltFixups[LI].Value, LPltSlotIndex) then
+        PatchBL(LPltFixups[LI].Key, (LPltFileOffset + 32 + Cardinal(LPltSlotIndex * 16)) - LTextFileOffset);
+    end;
+    LTextSection.Position := LTextSection.Size;
+
+    // STEP 9: Emit _start entry point stub (executables only)
+    // Shared objects don't have _start; DllMain becomes DT_INIT if present
+    //========================================================================
+    if LIsSharedObject then
+    begin
+      // No _start for shared objects
+      LEntryPointOffset := 0;  // Will use DT_INIT for DllMain
+    end
+    else
+    begin
+      LEntryPointOffset := LTextSection.Size;
+
+      if LMainIndex >= 0 then
       begin
-        LSlotAddr := LSlide + UInt64(LTextSectionFileOff) + UInt64(LFuncOffsets[LJ]);
-        LPageIndex := (Int64(LSlotAddr) shr 12) - (Int64(LSlide + UInt64(LTextSectionFileOff) + UInt64(LByteOffset)) shr 12);
-        LOfs12 := LSlotAddr and $FFF;
-        if (LPageIndex >= -1048576) and (LPageIndex <= 1048575) then
-        begin
-          LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
-          PCardinal(@LTextBytes[LByteOffset])^ := $90000000 or LCardVal or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5);
-          PCardinal(@LTextBytes[LByteOffset + 4])^ := $91000000 or (LOfs12 shl 10) or (LCardVal shl 5) or LCardVal;
-        end;
+        LMainOffset := LFuncOffsets[LMainIndex];
+
+        // Initialize command line: pass argc/argv from stack to Tiger_InitCommandLine
+        // At _start: [RSP] = argc, [RSP+8..] = argv pointers
+        // LDR x0, [sp]; ADD x1, sp, #8
+        EmitARM64($F94003E0);
+        EmitARM64($910023E1);
+        if LInitCommandLineIdx >= 0 then
+          EmitBL(Int32(LFuncOffsets[LInitCommandLineIdx]) - Int32(LTextSection.Size));
+        if LHasSEH and (LInitExceptionsIdx >= 0) then
+          EmitBL(Int32(LFuncOffsets[LInitExceptionsIdx]) - Int32(LTextSection.Size));
+        if LHasSEH and (LInitSignalsIdx >= 0) then
+          EmitBL(Int32(LFuncOffsets[LInitSignalsIdx]) - Int32(LTextSection.Size));
+        EmitBL(Int32(LMainOffset) - Int32(LTextSection.Size));
+        EmitMovRegImm64(REG_X8, LINUXARM64_SYS_EXIT);
+        EmitARM64($D4000001);
+      end
+      else
+      begin
+        EmitMovRegImm64(REG_X0, 0);
+        EmitMovRegImm64(REG_X8, LINUXARM64_SYS_EXIT);
+        EmitARM64($D4000001);
       end;
     end;
 
-    LEntryOffset := 0;
-    for LFuncIdx := 0 to LFuncCount - 1 do
+    LTextSize := LTextSection.Size;
+
+    //========================================================================
+    // STEP 9b: Patch export symbol st_value in .dynsym
+    //========================================================================
+    if LHasExports then
     begin
-      LFunc := LCode.GetFunc(LFuncIdx);
-      if LFunc.IsEntryPoint then
+      for LI := 0 to LNumExports - 1 do
       begin
-        LEntryOffset := LFuncOffsets[LFuncIdx];
+        // Export entries start after STN_UNDEF + imports
+        // Each entry is 24 bytes, st_value is at offset 8
+        LCodeOffset := Cardinal((1 + LImportCount + LI) * ELF64_SYM_SIZE + 8);
+        LDynsymSection.Position := LCodeOffset;
+        LDynsymSection.WriteData(UInt64(BASE_VADDR + LTextFileOffset +
+          LFuncOffsets[LExportFuncs[LI].Key]));
+      end;
+      LDynsymSection.Position := LDynsymSection.Size;
+    end;
+
+    //========================================================================
+    // STEP 10: Build deferred dynamic sections & assemble ELF file
+    //========================================================================
+    LEntryVAddr := BASE_VADDR + LTextFileOffset + LEntryPointOffset;
+
+    if LHasImports or LIsSharedObject then
+    begin
+      //--------------------------------------------------------------------
+      // Calculate post-text offsets
+      //--------------------------------------------------------------------
+      LGotPltFileOffset := LTextFileOffset + LTextSize;
+      // Align .got.plt to 8
+      if LGotPltFileOffset mod 8 <> 0 then
+        LGotPltFileOffset := LGotPltFileOffset + (8 - LGotPltFileOffset mod 8);
+
+      LDynamicFileOffset := LGotPltFileOffset + Cardinal(3 + LImportCount) * 8;
+      // Align .dynamic to 8
+      if LDynamicFileOffset mod 8 <> 0 then
+        LDynamicFileOffset := LDynamicFileOffset + (8 - LDynamicFileOffset mod 8);
+
+      //--------------------------------------------------------------------
+      // Build .rela.plt (one entry per import)
+      //--------------------------------------------------------------------
+      for LI := 0 to LImportCount - 1 do
+      begin
+        // r_offset: VA of GOT[3+n]
+        LRelaPltSection.WriteData(
+          UInt64(BASE_VADDR + LGotPltFileOffset + Cardinal(3 + LI) * 8));
+        // r_info: ELF64_R_INFO(symbol_index, R_AARCH64_JUMP_SLOT)
+        LRelaPltSection.WriteData(
+          UInt64((UInt64(LI + 1) shl 32) or R_AARCH64_JUMP_SLOT));
+        // r_addend
+        LRelaPltSection.WriteData(Int64(0));
+      end;
+
+      //--------------------------------------------------------------------
+      // Build .plt stubs
+      //--------------------------------------------------------------------
+      // PLT[0] resolver (32 bytes)
+      begin
+        LPageIndex := Int64((BASE_VADDR + LGotPltFileOffset) shr 12) - Int64((BASE_VADDR + LPltFileOffset) shr 12);
+        LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
+        LPltSection.WriteData($90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5));
+        LPltSection.WriteData($F9400211);
+        LPltSection.WriteData($91004210);
+        LPltSection.WriteData($D61F0220);
+        LPltSection.WriteData($D503201F);
+        LPltSection.WriteData($D503201F);
+        LPltSection.WriteData($D503201F);
+        LPltSection.WriteData($D503201F);
+      end;
+      for LI := 0 to LImportCount - 1 do
+      begin
+        LGotEntryVAddr := BASE_VADDR + LGotPltFileOffset + Cardinal(3 + LI) * 8;
+        LRipAfterInstr := BASE_VADDR + LPltFileOffset + 32 + UInt64(LI) * 16;
+        LPageIndex := Int64(LGotEntryVAddr shr 12) - Int64(LRipAfterInstr shr 12);
+        LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
+        LOfs12 := Cardinal(LGotEntryVAddr and $FFF);
+        LPltSection.WriteData($90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5));
+        LPltSection.WriteData($F9400000 or ((LOfs12 div 8) shl 10) or (REG_X16 shl 5) or REG_X17));
+        LPltSection.WriteData($91000000 or (LOfs12 shl 10) or (REG_X16 shl 5) or REG_X16));
+        LPltSection.WriteData($D61F0220);
+      end;
+
+      //--------------------------------------------------------------------
+      // Build .got.plt
+      //--------------------------------------------------------------------
+      // GOT[0] = VA of .dynamic
+      LGotPltSection.WriteData(UInt64(BASE_VADDR + LDynamicFileOffset));
+      // GOT[1] = 0 (link_map, filled by ld-linux)
+      LGotPltSection.WriteData(UInt64(0));
+      // GOT[2] = 0 (_dl_runtime_resolve, filled by ld-linux)
+      LGotPltSection.WriteData(UInt64(0));
+      // GOT[3+n] = PLT[n]+6 (points to push instruction for lazy binding)
+      for LI := 0 to LImportCount - 1 do
+        LGotPltSection.WriteData(
+          UInt64(BASE_VADDR + LPltFileOffset + 32 + Cardinal(LI) * 16));
+
+      //--------------------------------------------------------------------
+      // Build .dynamic
+      //--------------------------------------------------------------------
+      // DT_NEEDED for each unique library
+      for LI := 0 to LLibNames.Count - 1 do
+      begin
+        LDynamicSection.WriteData(Int64(DT_NEEDED));
+        LDynamicSection.WriteData(Int64(LLibDynstrOffsets[LI]));
+      end;
+      // DT_SONAME (for shared objects)
+      if LIsSharedObject and (LSoName <> '') then
+      begin
+        LDynamicSection.WriteData(Int64(DT_SONAME));
+        LDynamicSection.WriteData(Int64(LSoNameDynstrOffset));
+      end;
+      // DT_INIT (initialization function for shared objects)
+      if LIsSharedObject and (LDllMainIndex >= 0) then
+      begin
+        LDynamicSection.WriteData(Int64(DT_INIT));
+        LDynamicSection.WriteData(Int64(BASE_VADDR + LTextFileOffset +
+          LFuncOffsets[LDllMainIndex]));
+      end;
+      // DT_RUNPATH (executables: find .so in same directory)
+      if not LIsSharedObject then
+      begin
+        LDynamicSection.WriteData(Int64(DT_RUNPATH));
+        LDynamicSection.WriteData(Int64(LRunpathDynstrOffset));
+      end;
+      // DT_HASH
+      LDynamicSection.WriteData(Int64(DT_HASH));
+      LDynamicSection.WriteData(Int64(BASE_VADDR + LHashFileOffset));
+      // DT_STRTAB
+      LDynamicSection.WriteData(Int64(DT_STRTAB));
+      LDynamicSection.WriteData(Int64(BASE_VADDR + LDynstrFileOffset));
+      // DT_SYMTAB
+      LDynamicSection.WriteData(Int64(DT_SYMTAB));
+      LDynamicSection.WriteData(Int64(BASE_VADDR + LDynsymFileOffset));
+      // DT_STRSZ
+      LDynamicSection.WriteData(Int64(DT_STRSZ));
+      LDynamicSection.WriteData(Int64(LDynstrSection.Size));
+      // DT_SYMENT
+      LDynamicSection.WriteData(Int64(DT_SYMENT));
+      LDynamicSection.WriteData(Int64(ELF64_SYM_SIZE));
+      // DT_PLTGOT
+      LDynamicSection.WriteData(Int64(DT_PLTGOT));
+      LDynamicSection.WriteData(Int64(BASE_VADDR + LGotPltFileOffset));
+      // DT_PLTRELSZ
+      LDynamicSection.WriteData(Int64(DT_PLTRELSZ));
+      LDynamicSection.WriteData(Int64(LRelaPltSection.Size));
+      // DT_PLTREL
+      LDynamicSection.WriteData(Int64(DT_PLTREL));
+      LDynamicSection.WriteData(Int64(DT_RELA));
+      // DT_JMPREL
+      LDynamicSection.WriteData(Int64(DT_JMPREL));
+      LDynamicSection.WriteData(Int64(BASE_VADDR + LRelaPltFileOffset));
+      // DT_NULL
+      LDynamicSection.WriteData(Int64(DT_NULL));
+      LDynamicSection.WriteData(Int64(0));
+
+      //--------------------------------------------------------------------
+      // Build .shstrtab (section name string table)
+      //--------------------------------------------------------------------
+      LShstrtabFileOffset := LDynamicFileOffset + Cardinal(LDynamicSection.Size);
+
+      LShstrtabSection.WriteData(Byte(0));  // index 0 = empty
+      LShstrPos := 1;
+      // Write section names and track offsets for section headers
+      // Order: .interp .hash .dynsym .dynstr .rela.plt .rodata .data .plt .text .got.plt .dynamic .shstrtab
+      LShstrtabSection.WriteBuffer(AnsiString('.interp'#0)[1], 8);     // pos 1
+      LShstrtabSection.WriteBuffer(AnsiString('.hash'#0)[1], 6);       // pos 9
+      LShstrtabSection.WriteBuffer(AnsiString('.dynsym'#0)[1], 8);     // pos 15
+      LShstrtabSection.WriteBuffer(AnsiString('.dynstr'#0)[1], 8);     // pos 23
+      LShstrtabSection.WriteBuffer(AnsiString('.rela.plt'#0)[1], 10);  // pos 31
+      LShstrtabSection.WriteBuffer(AnsiString('.rodata'#0)[1], 8);     // pos 41
+      LShstrtabSection.WriteBuffer(AnsiString('.data'#0)[1], 6);       // pos 49
+      LShstrtabSection.WriteBuffer(AnsiString('.plt'#0)[1], 5);        // pos 55
+      LShstrtabSection.WriteBuffer(AnsiString('.text'#0)[1], 6);       // pos 60
+      LShstrtabSection.WriteBuffer(AnsiString('.got.plt'#0)[1], 9);    // pos 66
+      LShstrtabSection.WriteBuffer(AnsiString('.dynamic'#0)[1], 9);    // pos 75
+      LShstrtabSection.WriteBuffer(AnsiString('.shstrtab'#0)[1], 10);  // pos 84
+
+      // Section headers follow .shstrtab
+      LShdrsFileOffset := LShstrtabFileOffset + Cardinal(LShstrtabSection.Size);
+      // Align to 8
+      if LShdrsFileOffset mod 8 <> 0 then
+        LShdrsFileOffset := LShdrsFileOffset + (8 - LShdrsFileOffset mod 8);
+      if LIsSharedObject then
+      begin
+        LSectionCount := 12;  // null + 11 sections (no .interp)
+        LInterpOffset := 0;
+      end
+      else
+      begin
+        LSectionCount := 13;  // null + 12 sections
+        LInterpOffset := 1;
+      end;
+
+      LTotalFileSize := LShdrsFileOffset + Cardinal(LSectionCount) * ELF64_SHDR_SIZE;
+    end
+    else
+    begin
+      // No imports -- simple layout
+      LTotalFileSize := LTextFileOffset + LTextSize;
+    end;
+
+    LResult := TMemoryStream.Create();
+    try
+      //----------------------------------------------------------------------
+      // ELF64 Header (64 bytes)
+      //----------------------------------------------------------------------
+      LResult.WriteData(ELF_MAGIC[0]);
+      LResult.WriteData(ELF_MAGIC[1]);
+      LResult.WriteData(ELF_MAGIC[2]);
+      LResult.WriteData(ELF_MAGIC[3]);
+      LResult.WriteData(Byte(ELFCLASS64));     // e_ident[4]: class
+      LResult.WriteData(Byte(ELFDATA2LSB));    // e_ident[5]: data encoding
+      LResult.WriteData(Byte(EV_CURRENT));     // e_ident[6]: version
+      LResult.WriteData(Byte(ELFOSABI_NONE));  // e_ident[7]: OS/ABI
+      LResult.WriteData(UInt64(0));            // e_ident[8..15]: padding
+
+      if LIsSharedObject then
+        LResult.WriteData(Word(ET_DYN))          // e_type (shared object)
+      else
+        LResult.WriteData(Word(ET_EXEC));        // e_type (executable)
+      LResult.WriteData(Word(EM_AARCH64));      // e_machine
+      LResult.WriteData(Cardinal(EV_CURRENT)); // e_version
+      if LIsSharedObject then
+        LResult.WriteData(UInt64(0))             // e_entry (none for .so)
+      else
+        LResult.WriteData(UInt64(LEntryVAddr));  // e_entry
+      LResult.WriteData(UInt64(ELF64_EHDR_SIZE)); // e_phoff
+      if LHasImports or LIsSharedObject then
+        LResult.WriteData(UInt64(LShdrsFileOffset))  // e_shoff
+      else
+        LResult.WriteData(UInt64(0));                // e_shoff (no section headers)
+      LResult.WriteData(Cardinal(0));          // e_flags
+      LResult.WriteData(Word(ELF64_EHDR_SIZE)); // e_ehsize
+      LResult.WriteData(Word(ELF64_PHDR_SIZE)); // e_phentsize
+      LResult.WriteData(Word(LPhdrCount));     // e_phnum
+      if LHasImports or LIsSharedObject then
+      begin
+        LResult.WriteData(Word(ELF64_SHDR_SIZE)); // e_shentsize
+        LResult.WriteData(Word(LSectionCount));    // e_shnum
+        LResult.WriteData(Word(12 - LInterpOffset)); // e_shstrndx (.shstrtab index)
+      end
+      else
+      begin
+        LResult.WriteData(Word(0));              // e_shentsize
+        LResult.WriteData(Word(0));              // e_shnum
+        LResult.WriteData(Word(0));              // e_shstrndx
+      end;
+
+      //----------------------------------------------------------------------
+      // Program Headers
+      //----------------------------------------------------------------------
+      if LHasImports or LIsSharedObject then
+      begin
+        // PT_PHDR -- program header table itself
+        LResult.WriteData(Cardinal(PT_PHDR));
+        LResult.WriteData(Cardinal(PF_R));
+        LResult.WriteData(UInt64(ELF64_EHDR_SIZE));
+        LResult.WriteData(UInt64(BASE_VADDR + ELF64_EHDR_SIZE));
+        LResult.WriteData(UInt64(BASE_VADDR + ELF64_EHDR_SIZE));
+        LResult.WriteData(UInt64(LPhdrTableSize));
+        LResult.WriteData(UInt64(LPhdrTableSize));
+        LResult.WriteData(UInt64(8));
+
+        // PT_INTERP (executables only, not shared objects)
+        if not LIsSharedObject then
+        begin
+          LResult.WriteData(Cardinal(PT_INTERP));
+          LResult.WriteData(Cardinal(PF_R));
+          LResult.WriteData(UInt64(LInterpFileOffset));
+          LResult.WriteData(UInt64(BASE_VADDR + LInterpFileOffset));
+          LResult.WriteData(UInt64(BASE_VADDR + LInterpFileOffset));
+          LResult.WriteData(UInt64(LInterpSection.Size));
+          LResult.WriteData(UInt64(LInterpSection.Size));
+          LResult.WriteData(UInt64(1));
+        end;
+
+        // PT_LOAD -- entire file (RWX)
+        LResult.WriteData(Cardinal(PT_LOAD));
+        LResult.WriteData(Cardinal(PF_R or PF_W or PF_X));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(BASE_VADDR));
+        LResult.WriteData(UInt64(BASE_VADDR));
+        LResult.WriteData(UInt64(LTotalFileSize));
+        LResult.WriteData(UInt64(LTotalFileSize));
+        LResult.WriteData(UInt64($200000));
+
+        // PT_DYNAMIC
+        LResult.WriteData(Cardinal(PT_DYNAMIC));
+        LResult.WriteData(Cardinal(PF_R or PF_W));
+        LResult.WriteData(UInt64(LDynamicFileOffset));
+        LResult.WriteData(UInt64(BASE_VADDR + LDynamicFileOffset));
+        LResult.WriteData(UInt64(BASE_VADDR + LDynamicFileOffset));
+        LResult.WriteData(UInt64(LDynamicSection.Size));
+        LResult.WriteData(UInt64(LDynamicSection.Size));
+        LResult.WriteData(UInt64(8));
+
+        // PT_GNU_STACK -- non-executable stack
+        LResult.WriteData(Cardinal(PT_GNU_STACK));
+        LResult.WriteData(Cardinal(PF_R or PF_W));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(16));
+      end
+      else
+      begin
+        // Single PT_LOAD (original Phase 1 layout)
+        LResult.WriteData(Cardinal(PT_LOAD));
+        LResult.WriteData(Cardinal(PF_R or PF_W or PF_X));
+        LResult.WriteData(UInt64(0));
+        LResult.WriteData(UInt64(BASE_VADDR));
+        LResult.WriteData(UInt64(BASE_VADDR));
+        LResult.WriteData(UInt64(LTotalFileSize));
+        LResult.WriteData(UInt64(LTotalFileSize));
+        LResult.WriteData(UInt64($200000));
+      end;
+
+      //----------------------------------------------------------------------
+      // Section data
+      //----------------------------------------------------------------------
+      if LHasImports or LIsSharedObject then
+      begin
+        // .interp (size=0 for shared objects, so writes nothing)
+        LResult.WriteBuffer(LInterpSection.Memory^, LInterpSection.Size);
+        // Pad to .hash alignment
+        while Cardinal(LResult.Size) < LHashFileOffset do
+          LResult.WriteData(Byte(0));
+        // .hash
+        LResult.WriteBuffer(LHashSection.Memory^, LHashSection.Size);
+        // Pad to .dynsym alignment
+        while Cardinal(LResult.Size) < LDynsymFileOffset do
+          LResult.WriteData(Byte(0));
+        // .dynsym
+        LResult.WriteBuffer(LDynsymSection.Memory^, LDynsymSection.Size);
+        // .dynstr
+        LResult.WriteBuffer(LDynstrSection.Memory^, LDynstrSection.Size);
+        // Pad to .rela.plt alignment
+        while Cardinal(LResult.Size) < LRelaPltFileOffset do
+          LResult.WriteData(Byte(0));
+        // .rela.plt
+        LResult.WriteBuffer(LRelaPltSection.Memory^, LRelaPltSection.Size);
+        // Pad to .rodata alignment
+        while Cardinal(LResult.Size) < LRoDataFileOffset do
+          LResult.WriteData(Byte(0));
+      end;
+
+      // .rodata (both paths)
+      LResult.WriteBuffer(LRoDataSection.Memory^, LRoDataSection.Size);
+
+      if LHasImports or LIsSharedObject then
+      begin
+        // Pad to .data alignment
+        while Cardinal(LResult.Size) < LDataFileOffset do
+          LResult.WriteData(Byte(0));
+      end;
+
+      // .data (both paths)
+      LResult.WriteBuffer(LDataSection.Memory^, LDataSection.Size);
+
+      if LHasImports then
+      begin
+        // Pad to .plt alignment
+        while Cardinal(LResult.Size) < LPltFileOffset do
+          LResult.WriteData(Byte(0));
+        // .plt
+        LResult.WriteBuffer(LPltSection.Memory^, LPltSection.Size);
+      end;
+
+      // .text (both paths)
+      LResult.WriteBuffer(LTextSection.Memory^, LTextSize);
+
+      if LHasImports or LIsSharedObject then
+      begin
+        // Pad to .got.plt alignment
+        while Cardinal(LResult.Size) < LGotPltFileOffset do
+          LResult.WriteData(Byte(0));
+        // .got.plt
+        LResult.WriteBuffer(LGotPltSection.Memory^, LGotPltSection.Size);
+        // .dynamic
+        LResult.WriteBuffer(LDynamicSection.Memory^, LDynamicSection.Size);
+        // .shstrtab
+        LResult.WriteBuffer(LShstrtabSection.Memory^, LShstrtabSection.Size);
+
+        //------------------------------------------------------------------
+        // Section Headers
+        //------------------------------------------------------------------
+        // Pad to alignment
+        while Cardinal(LResult.Size) < LShdrsFileOffset do
+          LResult.WriteData(Byte(0));
+
+        // [0] SHN_UNDEF
+        WriteShdr(LResult, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+        // [1] .interp (executables only)
+        if not LIsSharedObject then
+          WriteShdr(LResult, 1, SHT_PROGBITS, SHF_ALLOC,
+            BASE_VADDR + LInterpFileOffset, LInterpFileOffset,
+            Cardinal(LInterpSection.Size), 0, 0, 1, 0);
+        // [1 or 2] .hash
+        WriteShdr(LResult, 9, SHT_HASH, SHF_ALLOC,
+          BASE_VADDR + LHashFileOffset, LHashFileOffset,
+          Cardinal(LHashSection.Size), 3 - LInterpOffset, 0, 8, 4);
+        // [3] .dynsym
+        WriteShdr(LResult, 15, SHT_DYNSYM, SHF_ALLOC,
+          BASE_VADDR + LDynsymFileOffset, LDynsymFileOffset,
+          Cardinal(LDynsymSection.Size), 4 - LInterpOffset, 1, 8, ELF64_SYM_SIZE);
+        // [4] .dynstr
+        WriteShdr(LResult, 23, SHT_STRTAB, SHF_ALLOC,
+          BASE_VADDR + LDynstrFileOffset, LDynstrFileOffset,
+          Cardinal(LDynstrSection.Size), 0, 0, 1, 0);
+        // [5] .rela.plt
+        WriteShdr(LResult, 31, SHT_RELA, SHF_ALLOC or SHF_INFO_LINK,
+          BASE_VADDR + LRelaPltFileOffset, LRelaPltFileOffset,
+          Cardinal(LRelaPltSection.Size), 3 - LInterpOffset, 8 - LInterpOffset, 8, ELF64_RELA_SIZE);
+        // [6] .rodata
+        WriteShdr(LResult, 41, SHT_PROGBITS, SHF_ALLOC,
+          BASE_VADDR + LRoDataFileOffset, LRoDataFileOffset,
+          Cardinal(LRoDataSection.Size), 0, 0, 16, 0);
+        // [7] .data
+        WriteShdr(LResult, 49, SHT_PROGBITS, SHF_ALLOC or SHF_WRITE,
+          BASE_VADDR + LDataFileOffset, LDataFileOffset,
+          Cardinal(LDataSection.Size), 0, 0, 16, 0);
+        // [8] .plt
+        WriteShdr(LResult, 55, SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
+          BASE_VADDR + LPltFileOffset, LPltFileOffset,
+          Cardinal(LPltSection.Size), 0, 0, 16, 16);
+        // [9] .text
+        WriteShdr(LResult, 60, SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
+          BASE_VADDR + LTextFileOffset, LTextFileOffset,
+          LTextSize, 0, 0, 16, 0);
+        // [10] .got.plt
+        WriteShdr(LResult, 66, SHT_PROGBITS, SHF_ALLOC or SHF_WRITE,
+          BASE_VADDR + LGotPltFileOffset, LGotPltFileOffset,
+          Cardinal(LGotPltSection.Size), 0, 0, 8, 8);
+        // [11] .dynamic
+        WriteShdr(LResult, 75, SHT_DYNAMIC, SHF_ALLOC or SHF_WRITE,
+          BASE_VADDR + LDynamicFileOffset, LDynamicFileOffset,
+          Cardinal(LDynamicSection.Size), 4, 0, 8, ELF64_DYN_SIZE);
+        // [12] .shstrtab
+        WriteShdr(LResult, 84, SHT_STRTAB, 0,
+          0, LShstrtabFileOffset,
+          Cardinal(LShstrtabSection.Size), 0, 0, 1, 0);
+      end;
+
+      // Copy to result bytes
+      SetLength(Result, LResult.Size);
+      Move(LResult.Memory^, Result[0], LResult.Size);
+    finally
+      LResult.Free();
+    end;
+
+  finally
+    // Static linking cleanup
+    if LLinker <> nil then
+      LLinker.Free();
+    LOrigToPltIndex.Free();
+    LTryBeginLabels.Free();
+    LExceptLabels.Free();
+    LFinallyLabels.Free();
+    LEndLabels.Free();
+    LFloatTemps.Free();
+    LStaticImportResolved.Free();
+    LStaticLibPaths.Free();
+    LStaticSymbolNames.Free();
+    LDynamicImportIndices.Free();
+    LStaticImportIndices.Free();
+
+    LExportFuncs.Free();
+    LLibNames.Free();
+    LShstrtabSection.Free();
+    LDynamicSection.Free();
+    LGotPltSection.Free();
+    LPltSection.Free();
+    LRelaPltSection.Free();
+    LDynstrSection.Free();
+    LDynsymSection.Free();
+    LHashSection.Free();
+    LInterpSection.Free();
+    LPltFixups.Free();
+    LFuncAddrFixups.Free();
+    LGlobalFixups.Free();
+    LDataFixups.Free();
+    LJumpFixups.Free();
+    LCallFixups.Free();
+    LTextSection.Free();
+    LDataSection.Free();
+    LRoDataSection.Free();
+  end;
+end;
+
+//==============================================================================
+// GenerateELFObj -- Produces an ELF64 relocatable object file (.o)
+//==============================================================================
+
+function TTigerLinuxARM64Backend.GenerateELFObj(): TBytes;
+const
+  // ELF64 Constants
+  ELF_MAGIC: array[0..3] of Byte = ($7F, $45, $4C, $46);
+  ELFCLASS64    = 2;
+  ELFDATA2LSB   = 1;
+  ELFOSABI_NONE = 0;
+  ET_REL        = 1;  // Relocatable file
+  EM_AARCH64    = 183;
+
+  ELF64_EHDR_SIZE = 64;
+  ELF64_SHDR_SIZE = 64;
+  ELF64_SYM_SIZE  = 24;
+  ELF64_RELA_SIZE = 24;
+
+  // Section types
+  SHT_NULL     = 0;
+  SHT_PROGBITS = 1;
+  SHT_SYMTAB   = 2;
+  SHT_STRTAB   = 3;
+  SHT_RELA     = 4;
+
+  // Section flags
+  SHF_WRITE     = $1;
+  SHF_ALLOC     = $2;
+  SHF_EXECINSTR = $4;
+  SHF_INFO_LINK = $40;
+
+  // Symbol binding/type
+  STB_LOCAL  = 0;
+  STB_GLOBAL = 1;
+  STT_NOTYPE  = 0;
+  STT_FUNC    = 2;
+  STT_SECTION = 3;
+
+  // Special section indices
+  SHN_UNDEF = 0;
+
+  // Relocation types
+  R_AARCH64_CALL26 = 283;
+  R_AARCH64_ADR_PREL_PG_HI21 = 275;
+  R_AARCH64_ADD_ABS_LO12_NC = 277;
+  R_AARCH64_ABS64 = 257;
+
+type
+  TELFReloc = record
+    Offset: Cardinal;      // Offset in .text where reloc applies
+    SymbolIndex: Cardinal;  // Index into symbol table
+    RelocationType: Cardinal;
+    Addend: Int32;
+  end;
+
+var
+  LResult: TMemoryStream;
+  LTextSection: TMemoryStream;
+  LRoDataSection: TMemoryStream;
+  LStrtabData: TMemoryStream;
+  LShstrtabData: TMemoryStream;
+  LSymtab: TMemoryStream;
+  LRelaText: TMemoryStream;
+
+  // Section indices (0-based for our tracking, but ELF uses 1-based section numbers)
+  LShNull: Integer;      // 0: null
+  LShText: Integer;      // 1: .text
+  LShRoData: Integer;    // 2: .rodata
+  LShSymtab: Integer;    // 3: .symtab
+  LShStrtab: Integer;    // 4: .strtab
+  LShShstrtab: Integer;  // 5: .shstrtab
+  LShRelaText: Integer;  // 6: .rela.text
+  LSectionCount: Integer;
+
+  // String table helpers
+  LShstrtabOffsets: array[0..6] of Cardinal;  // Offsets of section names
+
+  // Symbol tracking
+  LSymCount: Integer;
+  LFirstGlobalSym: Integer;
+  LFuncSymIndices: TArray<Integer>;  // Symbol index for each function
+
+  // Relocation tracking
+  LTextRelocs: TList<TELFReloc>;
+  LReloc: TELFReloc;
+
+  // Code generation
+  LI, LJ, LK: Integer;
+  LFunc: TTigerFuncInfo;
+  LInstr: TTigerInstruction;
+  LFuncOffsets: TArray<Cardinal>;
+  LFuncEndOffsets: TArray<Cardinal>;
+  LLabelOffsets: TArray<Cardinal>;
+  LJumpFixups: TList<TPair<Cardinal, Integer>>;
+
+  // Stack frame
+  LStackFrameSize: Cardinal;
+  LLocalsSize: Integer;
+  LMaxCallArgs: Integer;
+  LOutgoingArgSpace: Cardinal;
+
+  // Temporaries
+  LExportName: string;
+  LParamTypes: TArray<TTigerValueType>;
+  LNameOffset: Cardinal;
+  LEntry: TTigerImportEntry;
+  LImportSymIndices: TDictionary<Integer, Integer>;
+
+  // Exception handling (Linux64: setjmp/longjmp based)
+  LExceptFrameSize: Integer;
+  LExceptFrameBaseOffset: Integer;
+  LTryBeginLabels: TDictionary<Integer, Integer>;   // label index -> scope index
+  LExceptLabels: TDictionary<Integer, Integer>;     // label index -> scope index
+  LFinallyLabels: TDictionary<Integer, Integer>;    // label index -> scope index
+  LEndLabels: TDictionary<Integer, Integer>;        // label index -> scope index
+  LHasSEH: Boolean;
+  LPushExceptFrameIdx: Integer;
+  LPopExceptFrameIdx: Integer;
+  LGetExceptFrameIdx: Integer;
+  LSigsetjmpIdx: Integer;
+  LInitExceptionsIdx: Integer;
+  LInitSignalsIdx: Integer;
+  LInitCommandLineIdx: Integer;
+  LScopeIdx: Integer;
+  LFrameOffset: Integer;
+  LExceptLabelIdx: Integer;
+
+  // Float arg classification
+  LFloatTemps: TDictionary<Integer, Boolean>;
+  LDataPageFixups: TList<Cardinal>;
+  LCondJumpFixups: TList<TPair<Cardinal, Integer>>;
+  LForwardJumpFixups: TList<TPair<Cardinal, Cardinal>>;
+  LPageIndex: Int64;
+  LAdrpImm: Cardinal;
+  LInsn: Cardinal;
+  LTargetReg: Byte;
+  LTargetIndex: Integer;
+  LInstrIdx: Integer;
+  LDataHandle: TTigerDataHandle;
+  LByteOffset: Cardinal;
+  LIncomingSpillSize: Cardinal;
+  LOfs12: Cardinal;
+
+  // ELF layout
+  LTextOffset: Cardinal;
+  LTextSize: Cardinal;
+  LRoDataOffset: Cardinal;
+  LRoDataSize: Cardinal;
+  LSymtabOffset: Cardinal;
+  LSymtabSize: Cardinal;
+  LStrtabOffset: Cardinal;
+  LStrtabSize: Cardinal;
+  LRelaTextOffset: Cardinal;
+  LRelaTextSize: Cardinal;
+  LShstrtabOffset: Cardinal;
+  LShstrtabSize: Cardinal;
+  LShdrsOffset: Cardinal;
+
+  //----------------------------------------------------------------------------
+  // Local AArch64 code emission helpers (same as GenerateELF)
+  //----------------------------------------------------------------------------
+  const
+    MIN_PARAM_SPILL_SIZE = 64;
+    LShRoDataSymIdx = 2;  // symtab index of .rodata section symbol
+
+  procedure EmitARM64(const AInsn: Cardinal);
+  begin
+    LTextSection.WriteData(AInsn);
+  end;
+
+  procedure PatchCondBranch(const ACodeOffset: Cardinal; const ATargetOffset: Cardinal);
+  var
+    LImm19: Int32;
+    LInsn: Cardinal;
+  begin
+    LImm19 := Int32(ATargetOffset) - Int32(ACodeOffset);
+    LImm19 := LImm19 div 4;
+    LTextSection.Position := ACodeOffset;
+    LTextSection.ReadData(LInsn, 4);
+    LTextSection.Position := ACodeOffset;
+    LTextSection.WriteData((LInsn and $FFF0001F) or ((Cardinal(LImm19) and $7FFFF) shl 5));
+  end;
+
+  procedure PatchUncondBranch(const ACodeOffset: Cardinal; const ATargetOffset: Cardinal);
+  var
+    LImm26: Int32;
+  begin
+    LImm26 := Int32(ATargetOffset) - Int32(ACodeOffset);
+    LImm26 := LImm26 div 4;
+    LTextSection.Position := ACodeOffset;
+    LTextSection.WriteData($14000000 or (Cardinal(LImm26) and $3FFFFFF));
+  end;
+
+  function IncomingParamSpillSize(): Int32;
+  begin
+    Result := Int32(Min(Length(LFunc.Params), 8) * 8);
+  end;
+
+  function SpillBaseSize(): Int32;
+  begin
+    Result := IncomingParamSpillSize();
+    if Result < MIN_PARAM_SPILL_SIZE then
+      Result := MIN_PARAM_SPILL_SIZE;
+  end;
+
+  function GetParamOffset(const AIndex: Integer): Int32;
+  begin
+    if LFunc.IsVariadic then
+      Result := -Int32((AIndex + 2) * 8)
+    else
+      Result := -Int32((AIndex + 1) * 8);
+  end;
+
+  function GetLocalOffset(const AIndex: Integer): Int32;
+  var
+    LOffset, LK: Integer;
+  begin
+    LOffset := SpillBaseSize();
+    for LK := 0 to AIndex do
+      LOffset := LOffset + LFunc.Locals[LK].LocalSize;
+    Result := -Int32(LOffset);
+  end;
+
+  function GetTempOffset(const ATempIndex: Integer): Int32;
+  var
+    LOffset, LK: Integer;
+  begin
+    LOffset := SpillBaseSize();
+    for LK := 0 to High(LFunc.Locals) do
+      LOffset := LOffset + LFunc.Locals[LK].LocalSize;
+    LOffset := LOffset + (ATempIndex + 1) * 8;
+    Result := -Int32(LOffset);
+  end;
+
+  procedure EmitMovX(const ADest, AVal: Byte);
+  begin
+    if (AVal >= 0) and (AVal <= 65535) then
+      EmitARM64($D2800000 or (Cardinal(AVal) shl 5) or ADest)
+    else
+      EmitARM64($D2800000 or (Cardinal(ADest) and 31));
+  end;
+
+  procedure EmitMovRegImm64(const ARd: Byte; const AImm: UInt64);
+  var
+    LImm: UInt64;
+    I: Integer;
+    LW: Cardinal;
+  begin
+    LImm := AImm;
+    EmitARM64($D2800000 or ((Cardinal(LImm and $FFFF) shl 5) or ARd));
+    for I := 1 to 3 do
+    begin
+      LW := Cardinal((LImm shr (I * 16)) and $FFFF);
+      if LW <> 0 then
+        EmitARM64($F2800000 or (Cardinal(I) shl 21) or ((LW shl 5) or ARd));
+    end;
+  end;
+
+  procedure EmitAddImm(const ARd, ARn: Byte; const AImm: Cardinal);
+  begin
+    if AImm <= 4095 then
+      EmitARM64($91000000 or (Cardinal(AImm) shl 10) or (Cardinal(ARn) shl 5) or ARd)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, AImm);
+      EmitARM64($8B000000 or (REG_X16 shl 16) or (Cardinal(ARn) shl 5) or ARd);
+    end;
+  end;
+
+  procedure EmitSubImm(const ARd, ARn: Byte; const AImm: Cardinal);
+  begin
+    if AImm <= 4095 then
+      EmitARM64($D1000000 or (Cardinal(AImm) shl 10) or (Cardinal(ARn) shl 5) or ARd)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, AImm);
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (Cardinal(ARn) shl 5) or ARd);
+    end;
+  end;
+
+  procedure EmitStpPre(const ARt1, ARt2, ARn: Byte; const AImm: Int32);
+  var
+    LImm7: Cardinal;
+  begin
+    LImm7 := Cardinal((AImm div 8) and $7F);
+    EmitARM64($A9800000 or (LImm7 shl 15) or (Cardinal(ARn) shl 5) or ARt1 or (Cardinal(ARt2) shl 10));
+  end;
+
+  procedure EmitLdpPost(const ARt1, ARt2, ARn: Byte; const AImm: Cardinal);
+  var
+    LImm7: Cardinal;
+  begin
+    LImm7 := (AImm div 8) and 127;
+    EmitARM64($A8C00000 or (LImm7 shl 15) or (Cardinal(ARn) shl 5) or ARt1 or (Cardinal(ARt2) shl 10));
+  end;
+
+  procedure EmitLdrX(const ARt, ARn: Byte; const AOffset: Cardinal);
+  begin
+    if (AOffset <= 32760) and ((AOffset and 7) = 0) then
+      EmitARM64($F9400000 or ((AOffset div 8) shl 10) or (Cardinal(ARn) shl 5) or ARt)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, AOffset);
+      EmitARM64($F8606800 or (REG_X16 shl 16) or (Cardinal(ARn) shl 5) or ARt);
+    end;
+  end;
+
+  procedure EmitStrX(const ARt, ARn: Byte; const AOffset: Cardinal);
+  begin
+    if (AOffset <= 32760) and ((AOffset and 7) = 0) then
+      EmitARM64($F9000000 or ((AOffset div 8) shl 10) or (Cardinal(ARn) shl 5) or ARt)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, AOffset);
+      EmitARM64($F8206800 or (REG_X16 shl 16) or (Cardinal(ARn) shl 5) or ARt);
+    end;
+  end;
+
+  procedure EmitLdurFp(const ARt: Byte; const ADisp: Int32);
+  var
+    LImm9: Cardinal;
+  begin
+    LImm9 := Cardinal(Int32(ADisp) and $1FF);
+    EmitARM64($F8400000 or (LImm9 shl 12) or (REG_FP shl 5) or ARt);
+  end;
+
+  procedure EmitSturFp(const ADisp: Int32; const ARt: Byte);
+  var
+    LImm9: Cardinal;
+  begin
+    LImm9 := Cardinal(Int32(ADisp) and $1FF);
+    EmitARM64($F8000000 or (LImm9 shl 12) or (REG_FP shl 5) or ARt);
+  end;
+
+  procedure EmitLdrFp(const ARt: Byte; const ADisp: Int32);
+  var
+    LOff: Cardinal;
+  begin
+    if ADisp >= 0 then
+    begin
+      LOff := Cardinal(ADisp);
+      if (LOff <= 32760) and ((LOff and 7) = 0) then
+        EmitARM64($F9400000 or ((LOff div 8) shl 10) or (REG_FP shl 5) or ARt)
+      else
+      begin
+        EmitMovRegImm64(REG_X16, LOff);
+        EmitARM64($8B000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+        EmitARM64($F9400000 or (REG_X16 shl 5) or ARt);
+      end;
+    end
+    else if ADisp >= -256 then
+      EmitLdurFp(ARt, ADisp)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, Cardinal(-ADisp));
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+      EmitARM64($F9400000 or (REG_X16 shl 5) or ARt);
+    end;
+  end;
+
+  procedure EmitStrFp(const ADisp: Int32; const ARt: Byte);
+  var
+    LOff: Cardinal;
+  begin
+    if ADisp >= 0 then
+    begin
+      LOff := Cardinal(ADisp);
+      if (LOff <= 32760) and ((LOff and 7) = 0) then
+        EmitARM64($F9000000 or ((LOff div 8) shl 10) or (REG_FP shl 5) or ARt)
+      else
+      begin
+        EmitMovRegImm64(REG_X16, LOff);
+        EmitARM64($8B000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+        EmitARM64($F9000000 or (REG_X16 shl 5) or ARt);
+      end;
+    end
+    else if ADisp >= -256 then
+      EmitSturFp(ADisp, ARt)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, Cardinal(-ADisp));
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+      EmitARM64($F9000000 or (REG_X16 shl 5) or ARt);
+    end;
+  end;
+
+  procedure EmitLdrFpD(const ADt: Byte; const ADisp: Int32);
+  var
+    LOff: Cardinal;
+  begin
+    if ADisp >= 0 then
+    begin
+      LOff := Cardinal(ADisp);
+      if (LOff <= 32760) and ((LOff and 7) = 0) then
+        EmitARM64($FD400000 or ((LOff div 8) shl 10) or (REG_FP shl 5) or ADt)
+      else
+      begin
+        EmitMovRegImm64(REG_X16, LOff);
+        EmitARM64($8B000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+        EmitARM64($FD400000 or (REG_X16 shl 5) or ADt);
+      end;
+    end
+    else if ADisp >= -256 then
+      EmitARM64($FC400000 or (Cardinal(Int32(ADisp) and $1FF) shl 12) or (REG_FP shl 5) or ADt)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, Cardinal(-ADisp));
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+      EmitARM64($FD400000 or (REG_X16 shl 5) or ADt);
+    end;
+  end;
+
+  procedure EmitStrFpD(const ADisp: Int32; const ADt: Byte);
+  var
+    LOff: Cardinal;
+  begin
+    if ADisp >= 0 then
+    begin
+      LOff := Cardinal(ADisp);
+      if (LOff <= 32760) and ((LOff and 7) = 0) then
+        EmitARM64($FD000000 or ((LOff div 8) shl 10) or (REG_FP shl 5) or ADt)
+      else
+      begin
+        EmitMovRegImm64(REG_X16, LOff);
+        EmitARM64($8B000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+        EmitARM64($FD000000 or (REG_X16 shl 5) or ADt);
+      end;
+    end
+    else if ADisp >= -256 then
+      EmitARM64($FC000000 or (Cardinal(Int32(ADisp) and $1FF) shl 12) or (REG_FP shl 5) or ADt)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, Cardinal(-ADisp));
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+      EmitARM64($FD000000 or (REG_X16 shl 5) or ADt);
+    end;
+  end;
+
+  procedure EmitBL(const AOffset: Int32);
+  var
+    LImm26: Cardinal;
+  begin
+    LImm26 := Cardinal(AOffset div 4) and $3FFFFFF;
+    EmitARM64($94000000 or LImm26);
+  end;
+
+  procedure EmitRet();
+  begin
+    EmitARM64($D65F03C0);
+  end;
+
+  procedure EmitAdrp(const ARd: Byte; const APage: Int32);
+  var
+    LImm: Cardinal;
+  begin
+    LImm := Cardinal(APage) and $1FFFFF;
+    EmitARM64($90000000 or ((LImm and $3) shl 29) or ((LImm shr 2) shl 16) or ARd);
+  end;
+
+  procedure AddCallReloc(const ASymIdx: Integer);
+  begin
+    LReloc.Offset := Cardinal(LTextSection.Size);
+    LReloc.SymbolIndex := ASymIdx;
+    LReloc.RelocationType := R_AARCH64_CALL26;
+    LReloc.Addend := 0;
+    LTextRelocs.Add(LReloc);
+  end;
+
+  procedure AddDataReloc(const AOffset: Cardinal; const ASymIdx: Integer;
+    const AType: Cardinal; const AAddend: Int32);
+  begin
+    LReloc.Offset := AOffset;
+    LReloc.SymbolIndex := ASymIdx;
+    LReloc.RelocationType := AType;
+    LReloc.Addend := AAddend;
+    LTextRelocs.Add(LReloc);
+  end;
+
+  procedure LoadOperandToReg(const AOp: TTigerOperand; const AReg: Byte);
+  begin
+    case AOp.Kind of
+      okImmediate:
+        EmitMovRegImm64(AReg, UInt64(AOp.ImmInt));
+      okTemp:
+        EmitLdrFp(AReg, GetTempOffset(AOp.TempHandle.Index));
+      okLocal:
+        if AOp.LocalHandle.IsParam then
+          EmitLdrFp(AReg, GetParamOffset(AOp.LocalHandle.Index))
+        else
+          EmitLdrFp(AReg, GetLocalOffset(AOp.LocalHandle.Index));
+      okData:
+        begin
+          LDataHandle.Index := AOp.DataHandle.Index;
+          LByteOffset := FData.GetEntry(LDataHandle).Offset;
+          AddDataReloc(Cardinal(LTextSection.Size), LShRoDataSymIdx,
+            R_AARCH64_ADR_PREL_PG_HI21, Int32(LByteOffset));
+          EmitAdrp(AReg, 0);
+          AddDataReloc(Cardinal(LTextSection.Size), LShRoDataSymIdx,
+            R_AARCH64_ADD_ABS_LO12_NC, Int32(LByteOffset));
+          EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
+        end;
+      okGlobal:
+        begin
+          LDataPageFixups.Add(LTextSection.Size);
+          EmitAdrp(REG_X16, 0);
+          LDataHandle.Index := AOp.DataHandle.Index;
+          LByteOffset := FGlobals.GetEntry(LDataHandle).Offset;
+          if LByteOffset <= 4095 then
+            EmitARM64($91000000 or (Cardinal(LByteOffset) shl 10) or (REG_X16 shl 5) or AReg)
+          else
+          begin
+            EmitMovRegImm64(REG_X17, LByteOffset);
+            EmitARM64($8B000000 or (REG_X17 shl 16) or (REG_X16 shl 5) or AReg);
+          end;
+        end;
+      okFunc:
+        begin
+          LK := AOp.FuncHandle.Index;
+          AddDataReloc(Cardinal(LTextSection.Size), LFuncSymIndices[LK],
+            R_AARCH64_ADR_PREL_PG_HI21, 0);
+          EmitAdrp(AReg, 0);
+          AddDataReloc(Cardinal(LTextSection.Size), LFuncSymIndices[LK],
+            R_AARCH64_ADD_ABS_LO12_NC, 0);
+          EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
+        end;
+    else
+      EmitMovRegImm64(AReg, 0);
+    end;
+  end;
+
+  procedure StoreTempFromReg(const ATempIndex: Integer; const AReg: Byte);
+  begin
+    if GetTempOffset(ATempIndex) >= -255 then
+      EmitStrFp(GetTempOffset(ATempIndex), AReg)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, Cardinal(-GetTempOffset(ATempIndex)));
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+      EmitStrX(AReg, REG_X16, 0);
+    end;
+  end;
+
+  function IsFloatArg(const AOp: TTigerOperand): Boolean;
+  begin
+    case AOp.Kind of
+      okImmediate:
+        Result := AOp.ValueType in [vtFloat32, vtFloat64];
+      okTemp:
+        Result := LFloatTemps.ContainsKey(AOp.TempHandle.Index);
+      okLocal:
+        begin
+          if (AOp.LocalHandle.Index >= 0) and
+             (AOp.LocalHandle.Index < Length(LFunc.Locals)) then
+            Result := LFunc.Locals[AOp.LocalHandle.Index].LocalType in [vtFloat32, vtFloat64]
+          else
+            Result := False;
+        end;
+    else
+      Result := False;
+    end;
+  end;
+
+  procedure LoadOperandToVReg(const AOp: TTigerOperand; const ADV: Byte);
+  var
+    LBits: UInt64;
+  begin
+    case AOp.Kind of
+      okImmediate:
+        begin
+          LBits := UInt64(PInt64(@AOp.ImmFloat)^);
+          EmitMovRegImm64(REG_X16, LBits);
+          EmitARM64($9E670000 or (REG_X16 shl 5) or ADV);
+        end;
+      okLocal:
+        if AOp.LocalHandle.IsParam then
+          EmitLdrFpD(ADV, GetParamOffset(AOp.LocalHandle.Index))
+        else
+          EmitLdrFpD(ADV, GetLocalOffset(AOp.LocalHandle.Index));
+      okTemp:
+        EmitLdrFpD(ADV, GetTempOffset(AOp.TempHandle.Index));
+    else
+      begin
+        LoadOperandToReg(AOp, REG_X16);
+        EmitARM64($9E670000 or (REG_X16 shl 5) or ADV);
+      end;
+    end;
+  end;
+
+  procedure StoreTempFromVReg(const ATempIndex: Integer; const ADV: Byte);
+  begin
+    if GetTempOffset(ATempIndex) >= -255 then
+      EmitStrFpD(GetTempOffset(ATempIndex), ADV)
+    else
+    begin
+      EmitMovRegImm64(REG_X16, Cardinal(-GetTempOffset(ATempIndex)));
+      EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);
+      EmitARM64($FD000000 or (REG_X16 shl 5) or ADV);
+    end;
+  end;
+
+  procedure AddStrtabString(const AStr: string; out AOffset: Cardinal);
+  var
+    LAnsi: AnsiString;
+  begin
+    AOffset := Cardinal(LStrtabData.Size);
+    LAnsi := AnsiString(AStr);
+    if Length(LAnsi) > 0 then
+      LStrtabData.WriteBuffer(LAnsi[1], Length(LAnsi));
+    LStrtabData.WriteData(Byte(0));
+  end;
+
+  procedure AddShstrtabString(const AStr: string; out AOffset: Cardinal);
+  var
+    LAnsi: AnsiString;
+  begin
+    AOffset := Cardinal(LShstrtabData.Size);
+    LAnsi := AnsiString(AStr);
+    if Length(LAnsi) > 0 then
+      LShstrtabData.WriteBuffer(LAnsi[1], Length(LAnsi));
+    LShstrtabData.WriteData(Byte(0));
+  end;
+
+  procedure WriteSymbol(const ANameIdx: Cardinal; const AInfo: Byte;
+    const AOther: Byte; const AShndx: Word; const AValue: UInt64;
+    const ASize: UInt64);
+  begin
+    LSymtab.WriteData(ANameIdx);  // st_name (4 bytes)
+    LSymtab.WriteData(AInfo);     // st_info (1 byte)
+    LSymtab.WriteData(AOther);    // st_other (1 byte)
+    LSymtab.WriteData(AShndx);    // st_shndx (2 bytes)
+    LSymtab.WriteData(AValue);    // st_value (8 bytes)
+    LSymtab.WriteData(ASize);     // st_size (8 bytes)
+  end;
+
+  procedure WriteSectionHeader(const AName: Cardinal; const AType: Cardinal;
+    const AFlags: UInt64; const AAddr: UInt64; const AOffset: UInt64;
+    const ASize: UInt64; const ALink: Cardinal; const AInfo: Cardinal;
+    const AAddralign: UInt64; const AEntsize: UInt64);
+  begin
+    LResult.WriteData(AName);       // sh_name
+    LResult.WriteData(AType);       // sh_type
+    LResult.WriteData(AFlags);      // sh_flags
+    LResult.WriteData(AAddr);       // sh_addr
+    LResult.WriteData(AOffset);     // sh_offset
+    LResult.WriteData(ASize);       // sh_size
+    LResult.WriteData(ALink);       // sh_link
+    LResult.WriteData(AInfo);       // sh_info
+    LResult.WriteData(AAddralign);  // sh_addralign
+    LResult.WriteData(AEntsize);    // sh_entsize
+  end;
+
+  procedure WriteRela(const AOffset: UInt64; const ASymIdx: Cardinal;
+    const AType: Cardinal; const AAddend: Int64);
+  var
+    LInfo: UInt64;
+  begin
+    LInfo := (UInt64(ASymIdx) shl 32) or AType;
+    LRelaText.WriteData(AOffset);
+    LRelaText.WriteData(LInfo);
+    LRelaText.WriteData(AAddend);
+  end;
+
+begin
+  Result := nil;
+
+  LResult := TMemoryStream.Create();
+  LTextSection := TMemoryStream.Create();
+  LRoDataSection := TMemoryStream.Create();
+  LStrtabData := TMemoryStream.Create();
+  LShstrtabData := TMemoryStream.Create();
+  LSymtab := TMemoryStream.Create();
+  LRelaText := TMemoryStream.Create();
+  LJumpFixups := TList<TPair<Cardinal, Integer>>.Create();
+  LTextRelocs := TList<TELFReloc>.Create();
+  LImportSymIndices := TDictionary<Integer, Integer>.Create();
+  LTryBeginLabels := TDictionary<Integer, Integer>.Create();
+  LExceptLabels := TDictionary<Integer, Integer>.Create();
+  LFinallyLabels := TDictionary<Integer, Integer>.Create();
+  LEndLabels := TDictionary<Integer, Integer>.Create();
+  LFloatTemps := TDictionary<Integer, Boolean>.Create();
+  LCondJumpFixups := TList<TPair<Cardinal, Integer>>.Create();
+  LForwardJumpFixups := TList<TPair<Cardinal, Cardinal>>.Create();
+  LDataPageFixups := TList<Cardinal>.Create();
+  LHasSEH := False;
+  LPushExceptFrameIdx := -1;
+  LPopExceptFrameIdx := -1;
+  LGetExceptFrameIdx := -1;
+  LSigsetjmpIdx := -1;
+  LInitExceptionsIdx := -1;
+  LInitSignalsIdx := -1;
+  LInitCommandLineIdx := -1;
+
+  try
+    // Section indices
+    LShNull := 0;
+    LShText := 1;
+    LShRoData := 2;
+    LShSymtab := 3;
+    LShStrtab := 4;
+    LShShstrtab := 5;
+    LShRelaText := 6;
+    LSectionCount := 7;
+
+    //==========================================================================
+    // STEP 1: Build section name string table (.shstrtab)
+    //==========================================================================
+    AddShstrtabString('', LShstrtabOffsets[0]);           // Null section
+    AddShstrtabString('.text', LShstrtabOffsets[1]);
+    AddShstrtabString('.rodata', LShstrtabOffsets[2]);
+    AddShstrtabString('.symtab', LShstrtabOffsets[3]);
+    AddShstrtabString('.strtab', LShstrtabOffsets[4]);
+    AddShstrtabString('.shstrtab', LShstrtabOffsets[5]);
+    AddShstrtabString('.rela.text', LShstrtabOffsets[6]);
+
+    //==========================================================================
+    // STEP 2: Build symbol string table (.strtab) and symbol table (.symtab)
+    //==========================================================================
+    // First byte of strtab must be null
+    LStrtabData.WriteData(Byte(0));
+
+    // Symbol 0: null symbol (required)
+    WriteSymbol(0, 0, 0, 0, 0, 0);
+    LSymCount := 1;
+
+    // Section symbols (for relocations)
+    // Symbol 1: .text section
+    WriteSymbol(0, (STB_LOCAL shl 4) or STT_SECTION, 0, Word(LShText), 0, 0);
+    Inc(LSymCount);
+
+    // Symbol 2: .rodata section
+    WriteSymbol(0, (STB_LOCAL shl 4) or STT_SECTION, 0, Word(LShRoData), 0, 0);
+    Inc(LSymCount);
+
+    LFirstGlobalSym := LSymCount;  // First global symbol index
+
+    //------------------------------------------------------------------------
+    // Check for exception handling and find runtime function/import indices
+    //------------------------------------------------------------------------
+    for LI := 0 to FCode.GetFuncCount() - 1 do
+    begin
+      LFunc := FCode.GetFunc(LI);
+      // Check for exception scopes
+      if Length(LFunc.ExceptionScopes) > 0 then
+        LHasSEH := True;
+      // Find exception runtime function indices by name
+      if SameText(LFunc.FuncName, 'Tiger_PushExceptFrame') then
+        LPushExceptFrameIdx := LI
+      else if SameText(LFunc.FuncName, 'Tiger_PopExceptFrame') then
+        LPopExceptFrameIdx := LI
+      else if SameText(LFunc.FuncName, 'Tiger_GetExceptFrame') then
+        LGetExceptFrameIdx := LI
+      else if SameText(LFunc.FuncName, 'Tiger_InitExceptions') then
+        LInitExceptionsIdx := LI
+      else if SameText(LFunc.FuncName, 'Tiger_InitSignals') then
+        LInitSignalsIdx := LI
+      else if SameText(LFunc.FuncName, 'Tiger_InitCommandLine') then
+        LInitCommandLineIdx := LI;
+    end;
+
+    // Find __sigsetjmp import index
+    for LI := 0 to FImports.GetCount() - 1 do
+    begin
+      LEntry := FImports.GetEntryByIndex(LI);
+      if SameText(LEntry.FuncName, '__sigsetjmp') then
+      begin
+        LSigsetjmpIdx := LI;
         Break;
       end;
     end;
 
-    SetLength(LGotBytes, LGotStream.Size);
-    if LGotStream.Size > 0 then
+    // Add function symbols
+    SetLength(LFuncSymIndices, FCode.GetFuncCount());
+    for LI := 0 to FCode.GetFuncCount() - 1 do
     begin
-      LGotStream.Position := 0;
-      LGotStream.ReadBuffer(LGotBytes[0], LGotStream.Size);
-    end;
+      LFunc := FCode.GetFunc(LI);
 
-    //-------------------------------------------------------------------------
-    // Relocatable object output (MH_OBJECT) — used for TargetObj and TargetLib.
-    // Emits a minimal Mach-O object with __text (+ optional __cstring/__data) and
-    // an LC_SYMTAB containing public symbols so Tiger.Linker.MachO can resolve
-    // them when linking a static .a.
-    //-------------------------------------------------------------------------
-    if AFileType = MH_OBJECT then
-    begin
-      var LObjStream := TMemoryStream.Create();
-      var LStrtab := TMemoryStream.Create();
-      var LSymtab := TMemoryStream.Create();
-      var LExportSyms := TStringList.Create();
-      var LExportOffsets := TDictionary<string, UInt64>.Create();
-      try
-        LExportSyms.CaseSensitive := True;
-        LExportSyms.Sorted := True;
-        LExportSyms.Duplicates := dupIgnore;
-
-        // Collect public symbols (section-relative offsets within __text)
-        for LI := 0 to LFuncCount - 1 do
-        begin
-          LFunc := LCode.GetFunc(LI);
-          if not LFunc.IsPublic then
-            Continue;
-
-          var LSymName: string;
-          if LFunc.Linkage = plC then
-            LSymName := LFunc.FuncName
-          else
-          begin
-            var LParamTypes: TArray<TTigerValueType>;
-            SetLength(LParamTypes, Length(LFunc.Params));
-            for LK := 0 to High(LFunc.Params) do
-              LParamTypes[LK] := LFunc.Params[LK].ParamType;
-            LSymName := TTigerABIMangler.MangleFunctionWithLinkage(LFunc.FuncName, LParamTypes, LFunc.Linkage);
-          end;
-          LSymName := MachOSymbolName(LSymName);
-          if LExportSyms.IndexOf(LSymName) < 0 then
-            LExportSyms.Add(LSymName);
-          LExportOffsets.AddOrSetValue(LSymName, UInt64(LFuncOffsets[LI]));
-        end;
-
-        // Build string table (first byte 0)
-        LByteVal := 0;
-        LStrtab.WriteBuffer(LByteVal, 1);
-        var LStrOff: Cardinal := 1;
-
-        // Build symbol table (nlist_64, 16 bytes each)
-        // n_type = N_EXT ($01) | N_SECT ($0e) = $0f
-        for LI := 0 to LExportSyms.Count - 1 do
-        begin
-          var LNameA: AnsiString := AnsiString(LExportSyms[LI]);
-          var LFuncOff: UInt64 := 0;
-          if not LExportOffsets.TryGetValue(LExportSyms[LI], LFuncOff) then
-            LFuncOff := 0;
-
-          // n_strx
-          LCardVal := LStrOff;
-          LSymtab.WriteBuffer(LCardVal, 4);
-          // n_type, n_sect
-          LByteVal := $0f;
-          LSymtab.WriteBuffer(LByteVal, 1);
-          LByteVal := 1; // __text is section #1
-          LSymtab.WriteBuffer(LByteVal, 1);
-          // n_desc
-          var LDesc: Word := 0;
-          LSymtab.WriteBuffer(LDesc, 2);
-          // n_value
-          LVal := LFuncOff;
-          LSymtab.WriteBuffer(LVal, 8);
-
-          // Append string
-          if Length(LNameA) > 0 then
-            LStrtab.WriteBuffer(LNameA[1], Length(LNameA));
-          LByteVal := 0;
-          LStrtab.WriteBuffer(LByteVal, 1);
-          Inc(LStrOff, Cardinal(Length(LNameA)) + 1);
-        end;
-
-        // Sections to emit
-        var LHaveCStr := Length(LCStringBytes) > 0;
-        var LHaveData := Length(LDataBytes) > 0;
-        var LNumSects: Cardinal := 1 + Ord(LHaveCStr) + Ord(LHaveData);
-
-        // Sizes and offsets
-        var LHeaderSizeObj: Cardinal := 32;
-        var LSegCmdSize: Cardinal := 72 + 80 * LNumSects;
-        var LSymCmdSize: Cardinal := 24;
-        var LCmdsSize: Cardinal := LSegCmdSize + LSymCmdSize;
-        var LDataStart: Cardinal := LHeaderSizeObj + LCmdsSize;
-
-        var LTextOffObj: Cardinal := AlignUp32Local(LDataStart, 16);
-        var LCStrOffObj: Cardinal := AlignUp32Local(LTextOffObj + Cardinal(Length(LTextBytes)), 1);
-        var LDataOffObj: Cardinal := AlignUp32Local(LCStrOffObj + Cardinal(Length(LCStringBytes)), 8);
-        var LEndOff: Cardinal := LDataOffObj + Cardinal(Length(LDataBytes));
-
-        var LSymOffObj: Cardinal := AlignUp32Local(LEndOff, 8);
-        var LStrOffObj: Cardinal := LSymOffObj + Cardinal(LSymtab.Size);
-
-        // mach_header_64
-        LObjStream.Clear();
-        LCardVal := MH_MAGIC_64;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := CPU_TYPE_ARM64;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := CPU_SUBTYPE_ARM64_ALL;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := MH_OBJECT;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 2; // ncmds: LC_SEGMENT_64 + LC_SYMTAB
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := LCmdsSize;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 0; // flags
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 0; // reserved
-        LObjStream.WriteBuffer(LCardVal, 4);
-
-        // LC_SEGMENT_64 (single segment containing all sections)
-        LCardVal := LC_SEGMENT_64;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := LSegCmdSize;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        WriteFixedAnsiObj(LObjStream, AnsiString(SEG_TEXT), 16); // segname
-        LVal := 0; LObjStream.WriteBuffer(LVal, 8); // vmaddr
-        LVal := 0; LObjStream.WriteBuffer(LVal, 8); // vmsize
-        LVal := 0; LObjStream.WriteBuffer(LVal, 8); // fileoff
-        LVal := LEndOff; LObjStream.WriteBuffer(LVal, 8); // filesize
-        LCardVal := 7; LObjStream.WriteBuffer(LCardVal, 4); // maxprot rwx
-        LCardVal := 7; LObjStream.WriteBuffer(LCardVal, 4); // initprot rwx
-        LCardVal := LNumSects; LObjStream.WriteBuffer(LCardVal, 4); // nsects
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // flags
-
-        // section_64 records (80 bytes each)
-        // __text
-        WriteFixedAnsiObj(LObjStream, AnsiString(SECT_TEXT), 16);
-        WriteFixedAnsiObj(LObjStream, AnsiString(SEG_TEXT), 16);
-        LVal := 0; LObjStream.WriteBuffer(LVal, 8); // addr
-        LVal := UInt64(Length(LTextBytes)); LObjStream.WriteBuffer(LVal, 8); // size
-        LObjStream.WriteBuffer(LTextOffObj, 4); // offset
-        LCardVal := 4; LObjStream.WriteBuffer(LCardVal, 4); // align (2^4 = 16)
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // reloff
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // nreloc
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // flags
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // reserved1
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // reserved2
-        LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // reserved3
-
-        if LHaveCStr then
-        begin
-          WriteFixedAnsiObj(LObjStream, AnsiString(SECT_CSTRING), 16);
-          WriteFixedAnsiObj(LObjStream, AnsiString(SEG_TEXT), 16);
-          LVal := 0; LObjStream.WriteBuffer(LVal, 8);
-          LVal := UInt64(Length(LCStringBytes)); LObjStream.WriteBuffer(LVal, 8);
-          LObjStream.WriteBuffer(LCStrOffObj, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4); // align 1
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-        end;
-
-        if LHaveData then
-        begin
-          WriteFixedAnsiObj(LObjStream, AnsiString(SECT_DATA), 16);
-          WriteFixedAnsiObj(LObjStream, AnsiString(SEG_DATA), 16);
-          LVal := 0; LObjStream.WriteBuffer(LVal, 8);
-          LVal := UInt64(Length(LDataBytes)); LObjStream.WriteBuffer(LVal, 8);
-          LObjStream.WriteBuffer(LDataOffObj, 4);
-          LCardVal := 3; LObjStream.WriteBuffer(LCardVal, 4); // align 8
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-          LCardVal := 0; LObjStream.WriteBuffer(LCardVal, 4);
-        end;
-
-        // LC_SYMTAB
-        LCardVal := LC_SYMTAB;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LCardVal := LSymCmdSize;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LObjStream.WriteBuffer(LSymOffObj, 4);
-        LCardVal := LExportSyms.Count;
-        LObjStream.WriteBuffer(LCardVal, 4);
-        LObjStream.WriteBuffer(LStrOffObj, 4);
-        LCardVal := Cardinal(LStrtab.Size);
-        LObjStream.WriteBuffer(LCardVal, 4);
-
-        // Pad and write section data
-        LByteVal := 0;
-        while Cardinal(LObjStream.Position) < LTextOffObj do
-          LObjStream.WriteBuffer(LByteVal, 1);
-        if Length(LTextBytes) > 0 then
-          LObjStream.WriteBuffer(LTextBytes[0], Length(LTextBytes));
-        while Cardinal(LObjStream.Position) < LCStrOffObj do
-          LObjStream.WriteBuffer(LByteVal, 1);
-        if LHaveCStr then
-          LObjStream.WriteBuffer(LCStringBytes[0], Length(LCStringBytes));
-        while Cardinal(LObjStream.Position) < LDataOffObj do
-          LObjStream.WriteBuffer(LByteVal, 1);
-        if LHaveData then
-          LObjStream.WriteBuffer(LDataBytes[0], Length(LDataBytes));
-
-        while Cardinal(LObjStream.Position) < LSymOffObj do
-          LObjStream.WriteBuffer(LByteVal, 1);
-        if LSymtab.Size > 0 then
-        begin
-          LSymtab.Position := 0;
-          LObjStream.CopyFrom(LSymtab, LSymtab.Size);
-        end;
-        while Cardinal(LObjStream.Position) < LStrOffObj do
-          LObjStream.WriteBuffer(LByteVal, 1);
-        if LStrtab.Size > 0 then
-        begin
-          LStrtab.Position := 0;
-          LObjStream.CopyFrom(LStrtab, LStrtab.Size);
-        end;
-
-        SetLength(Result, LObjStream.Size);
-        if LObjStream.Size > 0 then
-        begin
-          LObjStream.Position := 0;
-          LObjStream.ReadBuffer(Result[0], LObjStream.Size);
-        end;
-        Exit;
-      finally
-        LExportOffsets.Free();
-        LExportSyms.Free();
-        LSymtab.Free();
-        LStrtab.Free();
-        LObjStream.Free();
-      end;
-    end;
-
-    LBindStream := TMemoryStream.Create();
-    try
-      for LI := 0 to LImports.GetCount() - 1 do
+      // Compute export name
+      if LFunc.Linkage = plC then
+        LExportName := LFunc.FuncName
+      else
       begin
-        if LHasStaticImports and (LStaticImportIndices.IndexOf(LI) >= 0) then
-          Continue;
-        LEntry := LImports.GetEntryByIndex(LI);
-        // Bind this symbol against the correct dylib ordinal.
-        LDylibName := NormalizeDylibName(LEntry.DllName);
-        if not LDylibOrdinals.TryGetValue(LDylibName, LDylibOrdinal) then
-          LDylibOrdinal := 1;
-        if LDylibOrdinal < 0 then
-          LDylibOrdinal := 1;
-        if LDylibOrdinal > 15 then
-          LDylibOrdinal := 1; // TODO: support SET_DYLIB_ORDINAL_ULEB for larger ordinals
-        LByteVal := Byte($10 or (LDylibOrdinal and $F));
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LByteVal := $40;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LByteVal := 95;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        for LK := 1 to Length(LEntry.FuncName) do
-        begin
-          LByteVal := Ord(LEntry.FuncName[LK]);
-          LBindStream.WriteBuffer(LByteVal, 1);
-        end;
-        LByteVal := 0;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LByteVal := $51;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        // SET_SEGMENT_AND_OFFSET_ULEB: imm = segment index.
-        // With __PAGEZERO + __TEXT preceding, __DATA is segment index 2.
-        LByteVal := $72;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LVal := LGotStartOffset + Cardinal(LI) * 8;
-        repeat
-          LJ := LVal and $7F;
-          LVal := LVal shr 7;
-          if LVal <> 0 then
-            LJ := LJ or $80;
-          LByteVal := Byte(LJ);
-          LBindStream.WriteBuffer(LByteVal, 1);
-        until LVal = 0;
-        LByteVal := $90;
-        LBindStream.WriteBuffer(LByteVal, 1);
+        SetLength(LParamTypes, Length(LFunc.Params));
+        for LJ := 0 to High(LFunc.Params) do
+          LParamTypes[LJ] := LFunc.Params[LJ].ParamType;
+        LExportName := TTigerABIMangler.MangleFunctionWithLinkage(
+          LFunc.FuncName, LParamTypes, LFunc.Linkage);
       end;
-      LByteVal := $00;
-      LBindStream.WriteBuffer(LByteVal, 1);
-      SetLength(LBindBytes, LBindStream.Size);
-      if LBindStream.Size > 0 then
-      begin
-        LBindStream.Position := 0;
-        LBindStream.ReadBuffer(LBindBytes[0], LBindStream.Size);
-      end;
-    finally
-      LBindStream.Free();
+
+      // Add name to strtab
+      AddStrtabString(LExportName, LNameOffset);
+
+      // Write symbol - we'll fix up st_value and st_size after code gen
+      // For now, just track the symbol index
+      LFuncSymIndices[LI] := LSymCount;
+
+      // Global function symbol - value/size will be patched later
+      if LFunc.IsPublic then
+        WriteSymbol(LNameOffset, (STB_GLOBAL shl 4) or STT_FUNC, 0, Word(LShText), 0, 0)
+      else
+        WriteSymbol(LNameOffset, (STB_LOCAL shl 4) or STT_FUNC, 0, Word(LShText), 0, 0);
+
+      Inc(LSymCount);
     end;
 
-    // Build export trie for any image with public functions (dylib or executable),
-    // so executables expose exports (e.g. for nm -gU) and dylibs can be bound to.
-    // Also build LC_SYMTAB (symbol + string table) so nm -gU shows exported symbols.
-    LExportBytes := nil;
-    LSymtabBytes := nil;
-    LStrtabBytes := nil;
+    //==========================================================================
+    // STEP 2b: Build .rodata section
+    //==========================================================================
+    if FData.GetSize() > 0 then
+      LRoDataSection.WriteBuffer(FData.GetDataPointer()^, FData.GetSize());
+    if LRoDataSection.Size = 0 then
+      LRoDataSection.WriteData(Byte(0));
+    AlignStream(LRoDataSection, 16);
+
+    //==========================================================================
+    // STEP 3: Generate code for each function
+    //==========================================================================
+    SetLength(LFuncOffsets, FCode.GetFuncCount());
+    SetLength(LFuncEndOffsets, FCode.GetFuncCount());
+
+    for LI := 0 to FCode.GetFuncCount() - 1 do
     begin
-      var LExportSyms: TStringList;
-      var LExportAddrs: TDictionary<string, UInt64>;
-      var LExportStream: TMemoryStream;
+      LFunc := FCode.GetFunc(LI);
+      LFuncOffsets[LI] := Cardinal(LTextSection.Size);
 
-      LExportSyms := TStringList.Create();
-      LExportAddrs := TDictionary<string, UInt64>.Create();
-      LExportStream := TMemoryStream.Create();
-      try
-        LExportSyms.CaseSensitive := True;
-        LExportSyms.Sorted := True;
-        LExportSyms.Duplicates := dupIgnore;
+      LJumpFixups.Clear();
+      LCondJumpFixups.Clear();
+      LForwardJumpFixups.Clear();
+      LDataPageFixups.Clear();
 
-        // Mach-O/macOS: dyld prepends one underscore when resolving bind symbols (see
-        // Tiger.Runtime.MacOS64 "dyld adds leading underscore when resolving"). So the
-        // EXE's bind stream has "_Z6AddCppii" and dyld looks for "__Z6AddCppii" in the
-        // dylib. We must therefore always prepend '_' to the export symbol name so that
-        // C → "_AddC" and C++ (Itanium _Z...) → "__Z6AddCppii".
-        for LI := 0 to LFuncCount - 1 do
+      LIncomingSpillSize := Cardinal(SpillBaseSize());
+
+      LLocalsSize := 0;
+      for LJ := 0 to High(LFunc.Locals) do
+        LLocalsSize := LLocalsSize + LFunc.Locals[LJ].LocalSize;
+
+      LExceptFrameSize := Length(LFunc.ExceptionScopes) * LINUXARM64_EXCEPT_FRAME_SIZE;
+
+      LTryBeginLabels.Clear();
+      LExceptLabels.Clear();
+      LFinallyLabels.Clear();
+      LEndLabels.Clear();
+      for LJ := 0 to High(LFunc.ExceptionScopes) do
+      begin
+        if LFunc.ExceptionScopes[LJ].TryBeginLabel.IsValid() then
+          LTryBeginLabels.AddOrSetValue(LFunc.ExceptionScopes[LJ].TryBeginLabel.Index, LJ);
+        if LFunc.ExceptionScopes[LJ].ExceptLabel.IsValid() then
+          LExceptLabels.AddOrSetValue(LFunc.ExceptionScopes[LJ].ExceptLabel.Index, LJ);
+        if LFunc.ExceptionScopes[LJ].FinallyLabel.IsValid() then
+          LFinallyLabels.AddOrSetValue(LFunc.ExceptionScopes[LJ].FinallyLabel.Index, LJ);
+        if LFunc.ExceptionScopes[LJ].EndLabel.IsValid() then
+          LEndLabels.AddOrSetValue(LFunc.ExceptionScopes[LJ].EndLabel.Index, LJ);
+      end;
+
+      LMaxCallArgs := 0;
+      for LJ := 0 to High(LFunc.Instructions) do
+        if LFunc.Instructions[LJ].Kind in [ikCallImport, ikCall, ikCallIndirect] then
+          if Length(LFunc.Instructions[LJ].Args) > Integer(LMaxCallArgs) then
+            LMaxCallArgs := Length(LFunc.Instructions[LJ].Args);
+
+      if LMaxCallArgs > 8 then
+        LOutgoingArgSpace := LMaxCallArgs * 8
+      else
+        LOutgoingArgSpace := 64;
+
+      LExceptFrameBaseOffset := LIncomingSpillSize + LLocalsSize +
+        Cardinal(LFunc.TempCount) * 8 + LOutgoingArgSpace;
+      if LExceptFrameSize > 0 then
+      begin
+        LExceptFrameBaseOffset := (LExceptFrameBaseOffset + 15) and (not 15);
+        LExceptFrameBaseOffset := LExceptFrameBaseOffset + 8;
+      end;
+      LStackFrameSize := LExceptFrameBaseOffset + Cardinal(LExceptFrameSize);
+      if (LStackFrameSize mod 16) <> 0 then
+        LStackFrameSize := (LStackFrameSize + 15) and (not 15);
+
+      EmitStpPre(REG_FP, REG_LR, REG_SP, -16);
+      EmitARM64($910003E0 or (REG_SP shl 5) or REG_FP);
+      if LStackFrameSize > 0 then
+        EmitSubImm(REG_SP, REG_SP, LStackFrameSize);
+
+      if LFunc.IsVariadic then
+      begin
+        EmitStrFp(-8, REG_X0);
+        EmitStrFp(-16, REG_X1);
+        EmitStrFp(-24, REG_X2);
+        EmitStrFp(-32, REG_X3);
+        EmitStrFp(-40, REG_X4);
+        EmitStrFp(-48, REG_X5);
+        EmitStrFp(-56, REG_X6);
+        EmitStrFp(-64, REG_X7);
+      end
+      else
+      begin
+        for LK := 0 to Min(Length(LFunc.Params) - 1, 7) do
+          EmitStrFp(GetParamOffset(LK), LK);
+      end;
+
+      SetLength(LLabelOffsets, Length(LFunc.Labels));
+      for LJ := 0 to High(LLabelOffsets) do
+        LLabelOffsets[LJ] := 0;
+
+      // Build float temp set for this function
+      LFloatTemps.Clear();
+      for LJ := 0 to High(LFunc.Instructions) do
+      begin
+        if LFunc.Instructions[LJ].Kind in [ikFAdd, ikFSub, ikFMul, ikFDiv, ikFNeg] then
+          LFloatTemps.AddOrSetValue(LFunc.Instructions[LJ].Dest.Index, True);
+        if (LFunc.Instructions[LJ].Kind = ikLoad) and
+           (LFunc.Instructions[LJ].Op1.Kind = okLocal) then
         begin
-          LFunc := LCode.GetFunc(LI);
-          if LFunc.IsPublic then
-          begin
-            var LExportSymName: string;
-            if LFunc.Linkage = plC then
-              LExportSymName := LFunc.FuncName
-            else
-            begin
-              var LParamTypes: TArray<TTigerValueType>;
-              SetLength(LParamTypes, Length(LFunc.Params));
-              for LK := 0 to High(LFunc.Params) do
-                LParamTypes[LK] := LFunc.Params[LK].ParamType;
-              LExportSymName := TTigerABIMangler.MangleFunctionWithLinkage(
-                LFunc.FuncName, LParamTypes, LFunc.Linkage);
-            end;
-            var LSym := '_' + LExportSymName;
-            // Address in export trie is vm-offset within the image.
-            // We always place __text at PAGE_SIZE.
-            var LAddr := UInt64(PAGE_SIZE) + UInt64(LFuncOffsets[LI]);
-            if LExportSyms.IndexOf(LSym) < 0 then
-              LExportSyms.Add(LSym);
-            LExportAddrs.AddOrSetValue(LSym, LAddr);
-          end;
+          if (LFunc.Instructions[LJ].Op1.LocalHandle.Index >= 0) and
+             (LFunc.Instructions[LJ].Op1.LocalHandle.Index < Length(LFunc.Locals)) and
+             (LFunc.Locals[LFunc.Instructions[LJ].Op1.LocalHandle.Index].LocalType in [vtFloat32, vtFloat64]) then
+            LFloatTemps.AddOrSetValue(LFunc.Instructions[LJ].Dest.Index, True);
         end;
+        // ikLoadPtr from a float-typed memory location produces a float temp
+        if (LFunc.Instructions[LJ].Kind = ikLoadPtr) and
+           LFunc.Instructions[LJ].MemIsFloat then
+          LFloatTemps.AddOrSetValue(LFunc.Instructions[LJ].Dest.Index, True);
+      end;
 
-        if LExportSyms.Count > 0 then
-        begin
-          // Root node: no terminal, N children. Each child label is the full symbol name.
-          // Child nodes are simple terminals with no children. Offsets in the trie are
-          // relative to the start of the export trie; the first child must start at
-          // exactly the root's byte size or dyld can mis-parse (e.g. "re-export ordinal").
-          var LChildNodes: array of TBytes;
-          SetLength(LChildNodes, LExportSyms.Count);
-          for LI := 0 to LExportSyms.Count - 1 do
-          begin
-            if not LExportAddrs.TryGetValue(LExportSyms[LI], LVal) then
-              LVal := 0;
-            LChildNodes[LI] := MakeTerminalNode(LVal);
-          end;
-
-          var LOffsets: array of Cardinal;
-          SetLength(LOffsets, LExportSyms.Count);
-          var LRootSize: Cardinal := 0;
-          var LPrevRootSize: Cardinal := 0;
-          repeat
-            LPrevRootSize := LRootSize;
-            LRootSize := Cardinal(UlebLen(0)) + 1;
-            for LI := 0 to LExportSyms.Count - 1 do
+      for LInstrIdx := 0 to High(LFunc.Instructions) do
+      begin
+        LInstr := LFunc.Instructions[LInstrIdx];
+        case LInstr.Kind of
+          ikCallImport:
             begin
-              var LOff: Cardinal := LRootSize;
-              for LK := 0 to LI - 1 do
-                Inc(LOff, Cardinal(Length(LChildNodes[LK])));
-              LOffsets[LI] := LOff;
-              Inc(LRootSize, Cardinal(Length(AnsiString(LExportSyms[LI])) + 1));
-              Inc(LRootSize, Cardinal(UlebLen(LOff)));
-            end;
-          until (LRootSize = LPrevRootSize);
-
-          // Build root into a temp stream so we use its exact size for the first child offset.
-          var LRootBuf: TMemoryStream;
-          LRootBuf := TMemoryStream.Create();
-          try
-            WriteUleb(LRootBuf, 0);
-            var LChildCount: Byte := Byte(LExportSyms.Count);
-            LRootBuf.WriteBuffer(LChildCount, 1);
-            for LI := 0 to LExportSyms.Count - 1 do
-            begin
-              var LLabel: AnsiString := AnsiString(LExportSyms[LI]);
-              if Length(LLabel) > 0 then
-                LRootBuf.WriteBuffer(LLabel[1], Length(LLabel));
-              var LNull: Byte := 0;
-              LRootBuf.WriteBuffer(LNull, 1);
-              WriteUleb(LRootBuf, LOffsets[LI]);
-            end;
-            var LRootActualSize: Cardinal := Cardinal(LRootBuf.Position);
-            if LRootActualSize <> LOffsets[0] then
-            begin
-              LOffsets[0] := LRootActualSize;
-              for LI := 1 to LExportSyms.Count - 1 do
-                LOffsets[LI] := LOffsets[LI - 1] + Cardinal(Length(LChildNodes[LI - 1]));
-              LRootBuf.Position := 0;
-              LRootBuf.Size := 0;
-              WriteUleb(LRootBuf, 0);
-              LRootBuf.WriteBuffer(LChildCount, 1);
-              for LI := 0 to LExportSyms.Count - 1 do
+              for LK := 0 to High(LInstr.Args) do
               begin
-                var LLabel: AnsiString := AnsiString(LExportSyms[LI]);
-                if Length(LLabel) > 0 then
-                  LRootBuf.WriteBuffer(LLabel[1], Length(LLabel));
-                var LNull: Byte := 0;
-                LRootBuf.WriteBuffer(LNull, 1);
-                WriteUleb(LRootBuf, LOffsets[LI]);
+                if LK < LINUXARM64_MAX_REG_ARGS then
+                  LoadOperandToReg(LInstr.Args[LK], LINUXARM64_ARG_REGS[LK])
+                else
+                begin
+                  LoadOperandToReg(LInstr.Args[LK], REG_X16);
+                  EmitStrX(REG_X16, REG_SP, Cardinal((LK - LINUXARM64_MAX_REG_ARGS) * 8));
+                end;
+              end;
+              LK := LInstr.ImportTarget.Index;
+              if (LK >= 0) and (LK < FImports.GetCount()) then
+              begin
+                if not LImportSymIndices.ContainsKey(LK) then
+                begin
+                  LEntry := FImports.GetEntryByIndex(LK);
+                  AddStrtabString(LEntry.FuncName, LNameOffset);
+                  LImportSymIndices.Add(LK, LSymCount);
+                  WriteSymbol(LNameOffset, (STB_GLOBAL shl 4) or STT_NOTYPE, 0, 0, 0, 0);
+                  Inc(LSymCount);
+                end;
+                AddCallReloc(LImportSymIndices[LK]);
+              end;
+              EmitBL(0);
+              if LInstr.Dest.IsValid() then
+                StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCall:
+            begin
+              for LK := 0 to Min(Length(LInstr.Args) - 1, 7) do
+                LoadOperandToReg(LInstr.Args[LK], LK);
+              LK := LInstr.FuncTarget.Index;
+              if (LK >= 0) and (LK < Length(LFuncSymIndices)) then
+                AddCallReloc(LFuncSymIndices[LK]);
+              EmitBL(0);
+              if LInstr.Dest.IsValid() then
+                StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikReturn:
+            begin
+              if LStackFrameSize > 0 then
+                EmitAddImm(REG_SP, REG_SP, LStackFrameSize);
+              EmitLdpPost(REG_FP, REG_LR, REG_SP, 16);
+              EmitRet();
+            end;
+          ikReturnValue:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              if LStackFrameSize > 0 then
+                EmitAddImm(REG_SP, REG_SP, LStackFrameSize);
+              EmitLdpPost(REG_FP, REG_LR, REG_SP, 16);
+              EmitRet();
+            end;
+          ikStore:
+            begin
+              if IsFloatArg(LInstr.Op2) then
+              begin
+                LoadOperandToVReg(LInstr.Op2, 0);
+                if LInstr.Op1.LocalHandle.IsParam then
+                  EmitStrFpD(GetParamOffset(LInstr.Op1.LocalHandle.Index), 0)
+                else
+                  EmitStrFpD(GetLocalOffset(LInstr.Op1.LocalHandle.Index), 0);
+              end
+              else
+              begin
+                LoadOperandToReg(LInstr.Op2, REG_X0);
+                if LInstr.Op1.LocalHandle.IsParam then
+                  EmitStrFp(GetParamOffset(LInstr.Op1.LocalHandle.Index), REG_X0)
+                else
+                  EmitStrFp(GetLocalOffset(LInstr.Op1.LocalHandle.Index), REG_X0);
               end;
             end;
-            LRootBuf.Position := 0;
-            if LRootBuf.Size > 0 then
-              LExportStream.CopyFrom(LRootBuf, LRootBuf.Size);
-          finally
-            LRootBuf.Free();
-          end;
-
-          for LI := 0 to High(LChildNodes) do
-            if Length(LChildNodes[LI]) > 0 then
-              LExportStream.WriteBuffer(LChildNodes[LI][0], Length(LChildNodes[LI]));
-
-          SetLength(LExportBytes, LExportStream.Size);
-          if LExportStream.Size > 0 then
-          begin
-            LExportStream.Position := 0;
-            LExportStream.ReadBuffer(LExportBytes[0], LExportStream.Size);
-          end;
-
-          // Build LC_SYMTAB (symbol table + string table) so nm -gU shows exports.
-          // nlist_64: n_strx (4), n_type (1), n_sect (1), n_desc (2), n_value (8) = 16 bytes.
-          // n_type = N_EXT ($01) or N_SECT ($0e) = $0f
-          var LStrtab: TMemoryStream;
-          var LSymtab: TMemoryStream;
-          var LStrOff: Cardinal;
-          var LNlist: array [0..15] of Byte;
-          LStrtab := TMemoryStream.Create();
-          LSymtab := TMemoryStream.Create();
-          try
-            LByteVal := 0;
-            LStrtab.WriteBuffer(LByteVal, 1);  // first byte 0 (empty string)
-            LStrOff := 1;
-            for LI := 0 to LExportSyms.Count - 1 do
+          ikLoad:
             begin
-              var LName: AnsiString := AnsiString(LExportSyms[LI]);
-              if not LExportAddrs.TryGetValue(LExportSyms[LI], LVal) then
-                LVal := 0;
-              // nlist_64: n_strx (offset into string table)
-              LNlist[0] := Byte(LStrOff);
-              LNlist[1] := Byte(LStrOff shr 8);
-              LNlist[2] := Byte(LStrOff shr 16);
-              LNlist[3] := Byte(LStrOff shr 24);
-              LNlist[4] := $0f;   // n_type = N_EXT | N_SECT
-              LNlist[5] := 1;    // n_sect = 1 (__text)
-              LNlist[6] := 0;    // n_desc
-              LNlist[7] := 0;
-              LNlist[8] := Byte(LVal);
-              LNlist[9] := Byte(LVal shr 8);
-              LNlist[10] := Byte(LVal shr 16);
-              LNlist[11] := Byte(LVal shr 24);
-              LNlist[12] := Byte(LVal shr 40);
-              LNlist[13] := Byte(LVal shr 48);
-              LNlist[14] := Byte(LVal shr 56);
-              LNlist[15] := Byte(LVal shr 56);  // n_value is 64-bit LE; top byte
-              LSymtab.WriteBuffer(LNlist[0], 16);
-              if Length(LName) > 0 then
-                LStrtab.WriteBuffer(LName[1], Length(LName));
-              LByteVal := 0;
-              LStrtab.WriteBuffer(LByteVal, 1);
-              Inc(LStrOff, Cardinal(Length(LName)) + 1);
+              if (LInstr.Op1.Kind = okLocal) and (LInstr.Op1.LocalHandle.Index >= 0) and
+                 (LInstr.Op1.LocalHandle.Index < Length(LFunc.Locals)) and
+                 (LFunc.Locals[LInstr.Op1.LocalHandle.Index].LocalType in [vtFloat32, vtFloat64]) then
+              begin
+                if LInstr.Op1.LocalHandle.IsParam then
+                  EmitLdrFpD(0, GetParamOffset(LInstr.Op1.LocalHandle.Index))
+                else
+                  EmitLdrFpD(0, GetLocalOffset(LInstr.Op1.LocalHandle.Index));
+                StoreTempFromVReg(LInstr.Dest.Index, 0);
+              end
+              else
+              begin
+                LoadOperandToReg(LInstr.Op1, REG_X0);
+                StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+              end;
             end;
-            SetLength(LSymtabBytes, LSymtab.Size);
-            if LSymtab.Size > 0 then
+          ikAdd:
             begin
-              LSymtab.Position := 0;
-              LSymtab.ReadBuffer(LSymtabBytes[0], LSymtab.Size);
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($8B000000 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
             end;
-            SetLength(LStrtabBytes, LStrtab.Size);
-            if LStrtab.Size > 0 then
+          ikSub:
             begin
-              LStrtab.Position := 0;
-              LStrtab.ReadBuffer(LStrtabBytes[0], LStrtab.Size);
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
             end;
-          finally
-            LStrtab.Free();
-            LSymtab.Free();
-          end;
+          ikMul:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($9B007C00 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikDiv:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($9BC07C00 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikMod:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($AA0003E0 or (REG_X0 shl 5) or REG_X17);
+              EmitARM64($9BC07C00 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              EmitARM64($9B000000 or (REG_X16 shl 16) or (REG_X17 shl 10) or (REG_X0 shl 5) or REG_X17);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X17);
+            end;
+          ikFAdd:
+            begin
+              LoadOperandToVReg(LInstr.Op1, 0);
+              LoadOperandToVReg(LInstr.Op2, 1);
+              EmitARM64($1E602800 or (1 shl 16) or (0 shl 5) or 0);
+              StoreTempFromVReg(LInstr.Dest.Index, 0);
+            end;
+          ikFSub:
+            begin
+              LoadOperandToVReg(LInstr.Op1, 0);
+              LoadOperandToVReg(LInstr.Op2, 1);
+              EmitARM64($1E603800 or (1 shl 16) or (0 shl 5) or 0);
+              StoreTempFromVReg(LInstr.Dest.Index, 0);
+            end;
+          ikFMul:
+            begin
+              LoadOperandToVReg(LInstr.Op1, 0);
+              LoadOperandToVReg(LInstr.Op2, 1);
+              EmitARM64($1E600800 or (1 shl 16) or (0 shl 5) or 0);
+              StoreTempFromVReg(LInstr.Dest.Index, 0);
+            end;
+          ikFDiv:
+            begin
+              LoadOperandToVReg(LInstr.Op1, 0);
+              LoadOperandToVReg(LInstr.Op2, 1);
+              EmitARM64($1E601800 or (1 shl 16) or (0 shl 5) or 0);
+              StoreTempFromVReg(LInstr.Dest.Index, 0);
+            end;
+          ikFNeg:
+            begin
+              LoadOperandToVReg(LInstr.Op1, 0);
+              LoadOperandToVReg(LInstr.Op2, 1);
+              EmitARM64($1E603800 or (1 shl 16) or (0 shl 5) or 0);
+              StoreTempFromVReg(LInstr.Dest.Index, 0);
+            end;
+          ikBitAnd:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($8A000000 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikBitOr:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($AA000000 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikBitXor:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($CA000000 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikBitNot:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              EmitARM64($AA2003E0 or (REG_X0 shl 16) or (REG_SP shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikShl:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($9AC02000 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikShr:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($9AC02800 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCmpEq:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($EB00001F or (REG_X16 shl 16) or (REG_X0 shl 5));
+              EmitARM64($9A9F07E0 or ((0 xor 1) shl 12) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCmpNe:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($EB00001F or (REG_X16 shl 16) or (REG_X0 shl 5));
+              EmitARM64($9A9F07E0 or ((1 xor 1) shl 12) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCmpLt:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($EB00001F or (REG_X16 shl 16) or (REG_X0 shl 5));
+              EmitARM64($9A9F07E0 or (($0B xor 1) shl 12) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCmpLe:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($EB00001F or (REG_X16 shl 16) or (REG_X0 shl 5));
+              EmitARM64($9A9F07E0 or (($0D xor 1) shl 12) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCmpGt:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($EB00001F or (REG_X16 shl 16) or (REG_X0 shl 5));
+              EmitARM64($9A9F07E0 or (($0C xor 1) shl 12) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCmpGe:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($EB00001F or (REG_X16 shl 16) or (REG_X0 shl 5));
+              EmitARM64($9A9F07E0 or (($0A xor 1) shl 12) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikCallIndirect:
+            begin
+              for LK := 0 to Min(Length(LInstr.Args) - 1, 7) do
+                LoadOperandToReg(LInstr.Args[LK], LK);
+              LoadOperandToReg(LInstr.Op1, REG_X16);
+              EmitARM64($D63F0000 or (REG_X16 shl 5));
+              if LInstr.Dest.IsValid() then
+                StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikStorePtr:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LoadOperandToReg(LInstr.Op2, REG_X16);
+              EmitARM64($F9000000 or (REG_X0 shl 5) or REG_X16);
+            end;
+          ikLoadPtr:
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              EmitARM64($F9400000 or (REG_X0 shl 5) or REG_X0);
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikAddressOf:
+            begin
+              if LInstr.Op1.LocalHandle.IsParam then
+                EmitSubImm(REG_X0, REG_FP, Cardinal(-GetParamOffset(LInstr.Op1.LocalHandle.Index)))
+              else
+                EmitSubImm(REG_X0, REG_FP, Cardinal(-GetLocalOffset(LInstr.Op1.LocalHandle.Index)));
+              StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+          ikLabel:
+            if LInstr.LabelTarget.IsValid() then
+            begin
+              LLabelOffsets[LInstr.LabelTarget.Index] := LTextSection.Size;
+
+              if LTryBeginLabels.TryGetValue(LInstr.LabelTarget.Index, LScopeIdx) then
+              begin
+                if LPushExceptFrameIdx < 0 then
+                  raise Exception.Create('Tiger_PushExceptFrame not found - exception handling runtime not linked');
+                if LSigsetjmpIdx < 0 then
+                  raise Exception.Create('__sigsetjmp not imported - exception handling runtime not linked');
+                LFrameOffset := LExceptFrameBaseOffset + Cardinal(LScopeIdx) * LINUXARM64_EXCEPT_FRAME_SIZE;
+                if LFrameOffset <= 4095 then
+                  EmitSubImm(REG_X0, REG_FP, LFrameOffset)
+                else
+                begin
+                  EmitMovRegImm64(REG_X16, LFrameOffset);
+                  EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X0);
+                end;
+                AddCallReloc(LFuncSymIndices[LPushExceptFrameIdx]);
+                EmitBL(0);
+                if LFrameOffset + 8 <= 4095 then
+                  EmitSubImm(REG_X0, REG_FP, LFrameOffset - 8)
+                else
+                begin
+                  EmitMovRegImm64(REG_X16, LFrameOffset - 8);
+                  EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X0);
+                end;
+                EmitMovX(REG_X1, 0);
+                if not LImportSymIndices.ContainsKey(LSigsetjmpIdx) then
+                begin
+                  LEntry := FImports.GetEntryByIndex(LSigsetjmpIdx);
+                  AddStrtabString(LEntry.FuncName, LNameOffset);
+                  WriteSymbol(LNameOffset, (STB_GLOBAL shl 4) or STT_NOTYPE, 0, SHN_UNDEF, 0, 0);
+                  LImportSymIndices.Add(LSigsetjmpIdx, LSymCount);
+                  Inc(LSymCount);
+                end;
+                AddCallReloc(LImportSymIndices[LSigsetjmpIdx]);
+                EmitBL(0);
+                if LFunc.ExceptionScopes[LScopeIdx].ExceptLabel.IsValid() then
+                  LExceptLabelIdx := LFunc.ExceptionScopes[LScopeIdx].ExceptLabel.Index
+                else if LFunc.ExceptionScopes[LScopeIdx].FinallyLabel.IsValid() then
+                  LExceptLabelIdx := LFunc.ExceptionScopes[LScopeIdx].FinallyLabel.Index
+                else
+                  LExceptLabelIdx := -1;
+                if LExceptLabelIdx >= 0 then
+                begin
+                  LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LExceptLabelIdx));
+                  EmitARM64($35000000);
+                end;
+              end;
+
+              if LEndLabels.TryGetValue(LInstr.LabelTarget.Index, LScopeIdx) then
+              begin
+                if LPopExceptFrameIdx < 0 then
+                  raise Exception.Create('Tiger_PopExceptFrame not found - exception handling runtime not linked');
+                AddCallReloc(LFuncSymIndices[LPopExceptFrameIdx]);
+                EmitBL(0);
+              end;
+            end;
+          ikJump:
+            if LInstr.LabelTarget.IsValid() then
+            begin
+              LJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.LabelTarget.Index));
+              EmitARM64($14000000);
+            end;
+          ikJumpIf:
+            if LInstr.LabelTarget.IsValid() then
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.LabelTarget.Index));
+              EmitARM64($35000000);
+            end;
+          ikJumpIfNot:
+            if LInstr.LabelTarget.IsValid() then
+            begin
+              LoadOperandToReg(LInstr.Op1, REG_X0);
+              LCondJumpFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.LabelTarget.Index));
+              EmitARM64($34000000);
+            end;
+          ikNop:
+            ;
+          ikSyscall:
+            begin
+              if Length(LInstr.Args) > 0 then LoadOperandToReg(LInstr.Args[0], REG_X0);
+              if Length(LInstr.Args) > 1 then LoadOperandToReg(LInstr.Args[1], REG_X1);
+              if Length(LInstr.Args) > 2 then LoadOperandToReg(LInstr.Args[2], REG_X2);
+              if Length(LInstr.Args) > 3 then LoadOperandToReg(LInstr.Args[3], REG_X3);
+              if Length(LInstr.Args) > 4 then LoadOperandToReg(LInstr.Args[4], REG_X4);
+              if Length(LInstr.Args) > 5 then LoadOperandToReg(LInstr.Args[5], REG_X5);
+              case LInstr.SyscallNr of
+                LINUXARM64_SYS_READ_X64:  EmitMovRegImm64(REG_X8, LINUXARM64_SYS_READ);
+                LINUXARM64_SYS_WRITE_X64: EmitMovRegImm64(REG_X8, LINUXARM64_SYS_WRITE);
+                LINUXARM64_SYS_EXIT_X64:  EmitMovRegImm64(REG_X8, LINUXARM64_SYS_EXIT);
+              else
+                EmitMovRegImm64(REG_X8, Cardinal(LInstr.SyscallNr));
+              end;
+              EmitARM64($D4000001);
+              if LInstr.Dest.IsValid() then
+                StoreTempFromReg(LInstr.Dest.Index, REG_X0);
+            end;
+        else
+          ;
         end;
-      finally
-        LExportStream.Free();
-        LExportAddrs.Free();
-        LExportSyms.Free();
-      end;
-    end;
-
-    LOutStream := TMemoryStream.Create();
-    try
-      LHeaderSize := 32;
-      LSegTextFileSize := (Length(LTextBytes) + Length(LCStringBytes) + 15) and (not 15);
-      LSegDataFileSize := (LGotStartOffset + Length(LGotBytes) + 15) and (not 15);
-      // Compute load command sizes dynamically based on dylib names.
-      // All LC_SEGMENT_64 must come first (dyld/kernel expect contiguous segments).
-      LDylibCmdSizeTotal := 0;
-      for LI := 0 to LDylibNames.Count - 1 do
-      begin
-        LNamePaddedSize := AlignUp8(Cardinal(Length(AnsiString(LDylibNames[LI])) + 1));
-        LDylibCmdSizeTotal := LDylibCmdSizeTotal + (24 + LNamePaddedSize); // dylib_command
       end;
 
-      if AIsDylib then
+      if Length(LFunc.Instructions) > 0 then
       begin
-        // LC_ID_DYLIB uses @loader_path/<filename> so the EXE can load from its folder.
-        LIdName := AnsiString('@loader_path/' + TPath.GetFileName(FOutputPath));
-        LNamePaddedSize := AlignUp8(Cardinal(Length(LIdName) + 1));
-        LDylibCmdSize := 24 + LNamePaddedSize;
-      end
-      else
-      begin
-        LIdName := '';
-        LDylibCmdSize := 24; // LC_MAIN
-      end;
-
-      // PAGEZERO(72) + TEXT(72+160) + DATA(72+160) + LINKEDIT(72) = 608
-      LLoadCmdSize := 608 + LDylibCmdSize + 16 {LC_VERSION_MIN_MACOSX} + 24 {LC_UUID} +
-                      (IfThen(AIsDylib, 0, 32)) {LC_LOAD_DYLINKER for exec only} +
-                      LDylibCmdSizeTotal {LC_LOAD_DYLIB*} +
-                      48 {LC_DYLD_INFO_ONLY} + 16 {LC_CODE_SIGNATURE} +
-                      (IfThen(Length(LSymtabBytes) > 0, 24, 0)) {LC_SYMTAB};
-      // Map Mach header inside __TEXT (canonical layout): __TEXT.fileoff = 0
-      LSegTextFileOff := 0;
-      // Place code at a page boundary after header/loadcmds.
-      LTextSectionFileOff := PAGE_SIZE;
-      // Total mapped __TEXT size: 16K aligned so segment layout satisfies ARM64 dyld/kernel.
-      LTextMapSize := AlignUp32(LTextSectionFileOff + LSegTextFileSize, SEGMENT_PAGE_SIZE);
-
-      LSegDataFileOff := LTextMapSize;
-      LRebaseOff := AlignUp32(LSegDataFileOff + LSegDataFileSize, SEGMENT_PAGE_SIZE);
-      LSegDataSegmentFileSize := LRebaseOff - LSegDataFileOff;
-      // Minimal rebase opcodes for PIE: rebase one pointer in __DATA *padding* (after __data+__got).
-      // REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: byte = (opcode<<4)|segment_imm; only offset ULEB follows (segment in nibble, not separate ULEB).
-      LBindStream := TMemoryStream.Create();
-      try
-        LByteVal := $11;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LByteVal := $22;  // opcode 2, segment 2 (__DATA) in low nibble; next is offset ULEB only
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LVal := UInt64(LGotStartOffset) + UInt64(Length(LGotBytes));
-        repeat
-          LJ := LVal and $7F;
-          LVal := LVal shr 7;
-          if LVal <> 0 then
-            LJ := LJ or $80;
-          LByteVal := Byte(LJ);
-          LBindStream.WriteBuffer(LByteVal, 1);
-        until LVal = 0;
-        LByteVal := $51;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        LByteVal := $00;
-        LBindStream.WriteBuffer(LByteVal, 1);
-        SetLength(LRebaseBytes, LBindStream.Size);
-        if LBindStream.Size > 0 then
+        if not (LFunc.Instructions[High(LFunc.Instructions)].Kind in [ikReturn, ikReturnValue]) then
         begin
-          LBindStream.Position := 0;
-          LBindStream.ReadBuffer(LRebaseBytes[0], LBindStream.Size);
+          if LStackFrameSize > 0 then
+            EmitAddImm(REG_SP, REG_SP, LStackFrameSize);
+          EmitLdpPost(REG_FP, REG_LR, REG_SP, 16);
+          EmitRet();
         end;
-      finally
-        LBindStream.Free();
-      end;
-      LBindOff := LRebaseOff + Cardinal(Length(LRebaseBytes));
-      LSegLinkEditFileOff := LRebaseOff;
-      // Place export trie (when present) immediately after bind opcodes, then symtab and strtab.
-      LExportOff := LBindOff + Cardinal(Length(LBindBytes));
-      if Length(LExportBytes) > 0 then
-      begin
-        LSymtabOff := LExportOff + Cardinal(Length(LExportBytes));
-        LStrtabOff := LSymtabOff + Cardinal(Length(LSymtabBytes));
-        LCodeLimit := LStrtabOff + Cardinal(Length(LStrtabBytes));
       end
       else
       begin
-        LExportOff := 0;
-        LSymtabOff := 0;
-        LStrtabOff := 0;
-        LCodeLimit := LBindOff + Cardinal(Length(LBindBytes));
-      end;
-      LSignatureOffset := AlignUp32(LCodeLimit, CODE_SIGNATURE_ALIGN);
-      LPadding := LSignatureOffset - LCodeLimit;
-      LNumPages := (LSignatureOffset + PAGE_SIZE - 1) div PAGE_SIZE;
-      // Use the same signing structure for all emitted Mach-O images:
-      // - 2 CodeDirectories (sha1 + sha256)
-      // - empty Requirements blob
-      // - empty CMS wrapper blob
-      //
-      // Also use a codesign-like identifier:
-      //   <name>-55554944<uuidhex>
-      // where 55554944 is ASCII 'UUID' in hex and <uuidhex> are the LC_UUID bytes.
-      var LIdentifierBytes: TBytes;
-      var LIdentifierSize: Cardinal;
-      var LExeName: string;
-      LExeName := ExtractFileName(FOutputPath);
-      if LExeName = '' then
-        LExeName := 'Tiger';
-      var LUUIDBytes: TBytes;
-      SetLength(LUUIDBytes, SizeOf(LUUID));
-      Move(LUUID, LUUIDBytes[0], SizeOf(LUUID));
-      var LIdent: string := LExeName + '-55554944' + BytesToHexLower(LUUIDBytes);
-      // NUL-terminated, then pad to even length (matches what codesign tends to do)
-      var LIdentAnsi: AnsiString := AnsiString(LIdent);
-      SetLength(LIdentifierBytes, Length(LIdentAnsi) + 1);
-      if Length(LIdentAnsi) > 0 then
-        Move(LIdentAnsi[1], LIdentifierBytes[0], Length(LIdentAnsi));
-      LIdentifierBytes[Length(LIdentAnsi)] := 0;
-      if (Length(LIdentifierBytes) and 1) <> 0 then
-        SetLength(LIdentifierBytes, Length(LIdentifierBytes) + 1);
-      LIdentifierSize := Cardinal(Length(LIdentifierBytes));
-      // IMPORTANT: LC_CODE_SIGNATURE.datasize must match the embedded SuperBlob length exactly.
-      // If datasize is larger, the kernel treats the tail bytes as an "attached" (detached)
-      // signature and will reject the image if that trailing region isn't a valid blob.
-      const LSpecialSlots: Cardinal = 2;
-      var LSuperHdrSize: Cardinal := 12 + 4 * 8;
-      var LCodeDirSha1Size: Cardinal := CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE + LIdentifierSize + (LSpecialSlots + LNumPages) * 20;
-      var LCodeDirSha256Size: Cardinal := CODE_SIGNATURE_CODEDIRECTORY_HEADER_SIZE + LIdentifierSize + (LSpecialSlots + LNumPages) * 32;
-      var LSuperLen: Cardinal := LSuperHdrSize + LCodeDirSha1Size + 12 + LCodeDirSha256Size + 8;
-      LSignatureSize := LSuperLen;
-      LSegLinkEditFileSize := Cardinal(Length(LRebaseBytes)) + Cardinal(Length(LBindBytes)) +
-                              Cardinal(Length(LExportBytes)) + Cardinal(Length(LSymtabBytes)) + Cardinal(Length(LStrtabBytes)) + LPadding + LSignatureSize;
-      LSlide := SEG_TEXT_VADDR - UInt64(LSegTextFileOff);
-
-      LCardVal := MH_MAGIC_64;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := CPU_TYPE_ARM64;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := CPU_SUBTYPE_ARM64_ALL;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      // mach_header_64 filetype
-      LCardVal := AFileType;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      // ncmds must match emitted load commands (see LLoadCmdSize comment).
-      // 4 segments + (LC_MAIN or LC_ID_DYLIB) + LC_VERSION_MIN + LC_UUID +
-      // (LC_LOAD_DYLINKER for exec) + N*LC_LOAD_DYLIB + LC_DYLD_INFO + [LC_SYMTAB] + LC_CODE_SIGNATURE
-      if AIsDylib then
-        LCmdCount := 9 + Cardinal(LDylibNames.Count) + (IfThen(Length(LSymtabBytes) > 0, 1, 0))
-      else
-        LCmdCount := 10 + Cardinal(LDylibNames.Count) + (IfThen(Length(LSymtabBytes) > 0, 1, 0));
-      LCardVal := LCmdCount;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LLoadCmdSize, 4);
-      if AIsDylib then
-        LCardVal := MH_NOUNDEFS or MH_DYLDLINK or MH_TWOLEVEL
-      else
-        LCardVal := MH_NOUNDEFS or MH_DYLDLINK or MH_TWOLEVEL or MH_PIE;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-
-      LCardVal := LC_SEGMENT_64;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 72;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi(SEG_PAGEZERO, 16);
-      LVal := 0;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := SEG_TEXT_VADDR;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := 0;
-      LOutStream.WriteBuffer(LVal, 8);
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-
-      LCardVal := LC_SEGMENT_64;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 72 + 160;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi('__TEXT', 16);
-      LVal := SEG_TEXT_VADDR;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LTextMapSize;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LSegTextFileOff;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LTextMapSize;
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := 5;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 5;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 2;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi('__text', 16);
-      WriteFixedAnsi('__TEXT', 16);
-      LVal := LSlide + UInt64(LTextSectionFileOff);
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := Length(LTextBytes);
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := LTextSectionFileOff;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 4;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi('__cstring', 16);
-      WriteFixedAnsi('__TEXT', 16);
-      LVal := LSlide + UInt64(LTextSectionFileOff) + UInt64(Length(LTextBytes));
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := Length(LCStringBytes);
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := LTextSectionFileOff + Length(LTextBytes);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 4;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-
-      LCardVal := LC_SEGMENT_64;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 72 + 160;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi('__DATA', 16);
-      LVal := LSlide + UInt64(LSegDataFileOff);
-      LOutStream.WriteBuffer(LVal, 8);
-      // vmsize 16K-aligned for ARM64 (dyld/kernel segment mapping).
-      LVal := AlignUp32(LSegDataSegmentFileSize, SEGMENT_PAGE_SIZE);
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LSegDataFileOff;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LSegDataSegmentFileSize;
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := 3;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 3;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 2;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi('__data', 16);
-      WriteFixedAnsi('__DATA', 16);
-      LVal := LSlide + UInt64(LSegDataFileOff);
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := Length(LDataBytes);
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := LSegDataFileOff;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi('__got', 16);
-      WriteFixedAnsi('__DATA', 16);
-      LVal := LSlide + UInt64(LSegDataFileOff) + UInt64(LGotStartOffset);
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := Length(LGotBytes);
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := LSegDataFileOff + LGotStartOffset;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-
-      // __LINKEDIT segment immediately after __DATA (all segments contiguous for dyld/kernel).
-      LCardVal := LC_SEGMENT_64;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 72;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      WriteFixedAnsi(SEG_LINKEDIT, 16);
-      LVal := LSlide + UInt64(LSegLinkEditFileOff);
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := AlignUp32(LSegLinkEditFileSize, SEGMENT_PAGE_SIZE);
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LSegLinkEditFileOff;
-      LOutStream.WriteBuffer(LVal, 8);
-      LVal := LSegLinkEditFileSize;
-      LOutStream.WriteBuffer(LVal, 8);
-      LCardVal := 1;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 1;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-
-      if AIsDylib then
-      begin
-        // LC_ID_DYLIB (dylib install name)
-        LCardVal := LC_ID_DYLIB;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := LDylibCmdSize;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 24; // name offset
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 0;  // timestamp
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LOutStream.WriteBuffer(LCardVal, 4); // current_version
-        LOutStream.WriteBuffer(LCardVal, 4); // compatibility_version
-        WritePaddedCString(LIdName, Integer(LDylibCmdSize - 24));
-      end
-      else
-      begin
-        // LC_MAIN
-        LCardVal := LC_MAIN;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 24;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LVal := UInt64(LTextSectionFileOff) + LEntryOffset;
-        LOutStream.WriteBuffer(LVal, 8);
-        LVal := 0;
-        LOutStream.WriteBuffer(LVal, 8);
+        if LStackFrameSize > 0 then
+          EmitAddImm(REG_SP, REG_SP, LStackFrameSize);
+        EmitLdpPost(REG_FP, REG_LR, REG_SP, 16);
+        EmitRet();
       end;
 
-      // LC_VERSION_MIN_MACOSX (match FPC; kernel may handle this better than LC_BUILD_VERSION)
-      LCardVal := LC_VERSION_MIN_MACOSX;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 16;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := $000A0900;  // 10.9.0
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := $000A0900;  // sdk 10.9.0
-      LOutStream.WriteBuffer(LCardVal, 4);
+      LFuncEndOffsets[LI] := Cardinal(LTextSection.Size);
 
-      // LC_UUID (required/expected by various tools)
-      LCardVal := LC_UUID;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 24;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LUUID, SizeOf(LUUID));
-
-      if not AIsDylib then
+      for LJ := 0 to LJumpFixups.Count - 1 do
+        PatchUncondBranch(LJumpFixups[LJ].Key, LLabelOffsets[LJumpFixups[LJ].Value]);
+      for LJ := 0 to LCondJumpFixups.Count - 1 do
+        PatchCondBranch(LCondJumpFixups[LJ].Key, LLabelOffsets[LCondJumpFixups[LJ].Value]);
+      for LJ := 0 to LForwardJumpFixups.Count - 1 do
       begin
-        // Executables need LC_LOAD_DYLINKER. Shared libraries do not.
-        LCardVal := LC_LOAD_DYLINKER;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 32;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 12;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        WritePaddedCString('/usr/lib/dyld', 20);
+        LTextSection.Position := LForwardJumpFixups[LJ].Key;
+        LTextSection.ReadData(LInsn, 4);
+        if (LInsn and $FF000000) = $54000000 then
+          PatchCondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value)
+        else
+          PatchUncondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value);
       end;
-
-      // LC_LOAD_DYLIB entries (dependencies). Ordinals are assigned in this order.
-      for LI := 0 to LDylibNames.Count - 1 do
-      begin
-        LCardVal := LC_LOAD_DYLIB;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LNamePaddedSize := AlignUp8(Cardinal(Length(AnsiString(LDylibNames[LI])) + 1));
-        LCardVal := 24 + LNamePaddedSize;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 24; // name offset
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 0; // timestamp
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LOutStream.WriteBuffer(LCardVal, 4); // current_version
-        LOutStream.WriteBuffer(LCardVal, 4); // compatibility_version
-        WritePaddedCString(AnsiString(LDylibNames[LI]), Integer(LNamePaddedSize));
-      end;
-
-      LCardVal := LC_DYLD_INFO_ONLY;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 48;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LRebaseOff, 4);
-      LCardVal := Length(LRebaseBytes);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LBindOff, 4);
-      LCardVal := Length(LBindBytes);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 0;
-      // weak_bind_off/size
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      // lazy_bind_off/size
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LCardVal, 4);
-      // export_off/size
-      if Length(LExportBytes) > 0 then
-      begin
-        LOutStream.WriteBuffer(LExportOff, 4);
-        LCardVal := Length(LExportBytes);
-        LOutStream.WriteBuffer(LCardVal, 4);
-      end
-      else
-      begin
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LOutStream.WriteBuffer(LCardVal, 4);
-      end;
-
-      if Length(LSymtabBytes) > 0 then
-      begin
-        LCardVal := LC_SYMTAB;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LCardVal := 24;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LOutStream.WriteBuffer(LSymtabOff, 4);
-        LCardVal := Length(LSymtabBytes) div 16;
-        LOutStream.WriteBuffer(LCardVal, 4);
-        LOutStream.WriteBuffer(LStrtabOff, 4);
-        LCardVal := Length(LStrtabBytes);
-        LOutStream.WriteBuffer(LCardVal, 4);
-      end;
-
-      LCardVal := LC_CODE_SIGNATURE;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LCardVal := 16;
-      LOutStream.WriteBuffer(LCardVal, 4);
-      LOutStream.WriteBuffer(LSignatureOffset, 4);
-      LOutStream.WriteBuffer(LSignatureSize, 4);
-
-      LByteVal := 0;
-      while Cardinal(LOutStream.Position) < LTextSectionFileOff do
-        LOutStream.WriteBuffer(LByteVal, 1);
-
-      if Length(LTextBytes) > 0 then
-        LOutStream.WriteBuffer(LTextBytes[0], Length(LTextBytes));
-      if Length(LCStringBytes) > 0 then
-        LOutStream.WriteBuffer(LCStringBytes[0], Length(LCStringBytes));
-      LK := LSegTextFileSize - Length(LTextBytes) - Length(LCStringBytes);
-      LByteVal := 0;
-      for LI := 0 to LK - 1 do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      while Cardinal(LOutStream.Position) < LSegDataFileOff do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      if Length(LDataBytes) > 0 then
-        LOutStream.WriteBuffer(LDataBytes[0], Length(LDataBytes));
-      LK := LGotStartOffset - Length(LDataBytes);
-      for LI := 0 to LK - 1 do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      if Length(LGotBytes) > 0 then
-        LOutStream.WriteBuffer(LGotBytes[0], Length(LGotBytes));
-      LK := LSegDataFileSize - LGotStartOffset - Length(LGotBytes);
-      for LI := 0 to LK - 1 do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      while Cardinal(LOutStream.Position) < LRebaseOff do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      if Length(LRebaseBytes) > 0 then
-        LOutStream.WriteBuffer(LRebaseBytes[0], Length(LRebaseBytes));
-      while Cardinal(LOutStream.Position) < LBindOff do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      if Length(LBindBytes) > 0 then
-        LOutStream.WriteBuffer(LBindBytes[0], Length(LBindBytes));
-      if Length(LExportBytes) > 0 then
-      begin
-        while Cardinal(LOutStream.Position) < LExportOff do
-          LOutStream.WriteBuffer(LByteVal, 1);
-        LOutStream.WriteBuffer(LExportBytes[0], Length(LExportBytes));
-      end;
-      if Length(LSymtabBytes) > 0 then
-      begin
-        while Cardinal(LOutStream.Position) < LSymtabOff do
-          LOutStream.WriteBuffer(LByteVal, 1);
-        LOutStream.WriteBuffer(LSymtabBytes[0], Length(LSymtabBytes));
-        while Cardinal(LOutStream.Position) < LStrtabOff do
-          LOutStream.WriteBuffer(LByteVal, 1);
-        LOutStream.WriteBuffer(LStrtabBytes[0], Length(LStrtabBytes));
-      end;
-      // Avoid "0 to LPadding-1" when LPadding=0: Cardinal underflow makes bound 4294967295 and Inc(LI) overflows
-      for LI := 1 to LPadding do
-        LOutStream.WriteBuffer(LByteVal, 1);
-      for LI := 1 to LSignatureSize do
-        LOutStream.WriteBuffer(LByteVal, 1);
-
-      SetLength(Result, LOutStream.Size);
-      LOutStream.Position := 0;
-      LOutStream.ReadBuffer(Result[0], LOutStream.Size);
-
-      BuildLinkerSignedSignature(
-        Result,
-        LSignatureOffset,
-        LNumPages,
-        LSignatureSize,
-        UInt64(LSegTextFileOff),
-        UInt64(LTextMapSize),
-        CS_EXECSEG_MAIN_BINARY,
-        False, // no CS_CD_FLAG_LINKER_SIGNED
-        True,  // always include Requirements + CMS wrapper blobs
-        LIdentifierBytes,
-        LSignatureBytes
-      );
-      if Length(LSignatureBytes) = LSignatureSize then
-        Move(LSignatureBytes[0], Result[LSignatureOffset], LSignatureSize);
-    finally
-      LOutStream.Free();
     end;
+
+    // Patch function symbol values and sizes
+    for LI := 0 to FCode.GetFuncCount() - 1 do
+    begin
+      LFunc := FCode.GetFunc(LI);
+      LSymtab.Position := LFuncSymIndices[LI] * ELF64_SYM_SIZE + 8;  // st_value offset
+      LSymtab.WriteData(UInt64(LFuncOffsets[LI]));
+      LSymtab.WriteData(UInt64(LFuncEndOffsets[LI] - LFuncOffsets[LI]));
+    end;
+    LSymtab.Position := LSymtab.Size;
+
+    //==========================================================================
+    // STEP 4: Build .rela.text section
+    //==========================================================================
+    for LI := 0 to LTextRelocs.Count - 1 do
+    begin
+      LReloc := LTextRelocs[LI];
+      WriteRela(LReloc.Offset, LReloc.SymbolIndex, LReloc.RelocationType, LReloc.Addend);
+    end;
+
+    //==========================================================================
+    // STEP 5: Calculate file layout
+    //==========================================================================
+    LTextSize := Cardinal(LTextSection.Size);
+    LRoDataSize := Cardinal(LRoDataSection.Size);
+    LSymtabSize := Cardinal(LSymtab.Size);
+    LStrtabSize := Cardinal(LStrtabData.Size);
+    LRelaTextSize := Cardinal(LRelaText.Size);
+    LShstrtabSize := Cardinal(LShstrtabData.Size);
+
+    // Layout: ELF header | .text | .rodata | .symtab | .strtab | .rela.text | .shstrtab | section headers
+    LTextOffset := ELF64_EHDR_SIZE;
+    LRoDataOffset := LTextOffset + LTextSize;
+    LSymtabOffset := LRoDataOffset + LRoDataSize;
+    LStrtabOffset := LSymtabOffset + LSymtabSize;
+    LRelaTextOffset := LStrtabOffset + LStrtabSize;
+    LShstrtabOffset := LRelaTextOffset + LRelaTextSize;
+    LShdrsOffset := LShstrtabOffset + LShstrtabSize;
+
+    //==========================================================================
+    // STEP 6: Write ELF header
+    //==========================================================================
+    // e_ident[16]
+    LResult.WriteData(ELF_MAGIC[0]);
+    LResult.WriteData(ELF_MAGIC[1]);
+    LResult.WriteData(ELF_MAGIC[2]);
+    LResult.WriteData(ELF_MAGIC[3]);
+    LResult.WriteData(Byte(ELFCLASS64));
+    LResult.WriteData(Byte(ELFDATA2LSB));
+    LResult.WriteData(Byte(1));  // EV_CURRENT
+    LResult.WriteData(Byte(ELFOSABI_NONE));
+    LResult.WriteData(UInt64(0));  // e_ident padding
+
+    LResult.WriteData(Word(ET_REL));     // e_type
+    LResult.WriteData(Word(EM_AARCH64));  // e_machine
+    LResult.WriteData(Cardinal(1));      // e_version
+    LResult.WriteData(UInt64(0));        // e_entry (none for .o)
+    LResult.WriteData(UInt64(0));        // e_phoff (no program headers)
+    LResult.WriteData(UInt64(LShdrsOffset));  // e_shoff
+    LResult.WriteData(Cardinal(0));      // e_flags
+    LResult.WriteData(Word(ELF64_EHDR_SIZE));  // e_ehsize
+    LResult.WriteData(Word(0));          // e_phentsize
+    LResult.WriteData(Word(0));          // e_phnum
+    LResult.WriteData(Word(ELF64_SHDR_SIZE));  // e_shentsize
+    LResult.WriteData(Word(LSectionCount));    // e_shnum
+    LResult.WriteData(Word(LShShstrtab));       // e_shstrndx
+
+    //==========================================================================
+    // STEP 7: Write section data
+    //==========================================================================
+    // .text
+    if LTextSize > 0 then
+    begin
+      LTextSection.Position := 0;
+      LResult.CopyFrom(LTextSection, LTextSize);
+    end;
+
+    // .rodata
+    if LRoDataSize > 0 then
+    begin
+      LRoDataSection.Position := 0;
+      LResult.CopyFrom(LRoDataSection, LRoDataSize);
+    end;
+
+    // .symtab
+    if LSymtabSize > 0 then
+    begin
+      LSymtab.Position := 0;
+      LResult.CopyFrom(LSymtab, LSymtabSize);
+    end;
+
+    // .strtab
+    if LStrtabSize > 0 then
+    begin
+      LStrtabData.Position := 0;
+      LResult.CopyFrom(LStrtabData, LStrtabSize);
+    end;
+
+    // .rela.text
+    if LRelaTextSize > 0 then
+    begin
+      LRelaText.Position := 0;
+      LResult.CopyFrom(LRelaText, LRelaTextSize);
+    end;
+
+    // .shstrtab
+    if LShstrtabSize > 0 then
+    begin
+      LShstrtabData.Position := 0;
+      LResult.CopyFrom(LShstrtabData, LShstrtabSize);
+    end;
+
+    //==========================================================================
+    // STEP 8: Write section headers
+    //==========================================================================
+    // SH[0]: null
+    WriteSectionHeader(0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    // SH[1]: .text
+    WriteSectionHeader(LShstrtabOffsets[1], SHT_PROGBITS,
+      SHF_ALLOC or SHF_EXECINSTR, 0, LTextOffset, LTextSize, 0, 0, 16, 0);
+
+    // SH[2]: .rodata
+    WriteSectionHeader(LShstrtabOffsets[2], SHT_PROGBITS,
+      SHF_ALLOC, 0, LRoDataOffset, LRoDataSize, 0, 0, 8, 0);
+
+    // SH[3]: .symtab - link=strtab index, info=first global symbol
+    WriteSectionHeader(LShstrtabOffsets[3], SHT_SYMTAB, 0, 0,
+      LSymtabOffset, LSymtabSize, LShStrtab, LFirstGlobalSym, 8, ELF64_SYM_SIZE);
+
+    // SH[4]: .strtab
+    WriteSectionHeader(LShstrtabOffsets[4], SHT_STRTAB, 0, 0,
+      LStrtabOffset, LStrtabSize, 0, 0, 1, 0);
+
+    // SH[5]: .shstrtab
+    WriteSectionHeader(LShstrtabOffsets[5], SHT_STRTAB, 0, 0,
+      LShstrtabOffset, LShstrtabSize, 0, 0, 1, 0);
+
+    // SH[6]: .rela.text - link=symtab, info=.text section index
+    WriteSectionHeader(LShstrtabOffsets[6], SHT_RELA, SHF_INFO_LINK, 0,
+      LRelaTextOffset, LRelaTextSize, LShSymtab, LShText, 8, ELF64_RELA_SIZE);
+
+    // Return result
+    SetLength(Result, LResult.Size);
+    LResult.Position := 0;
+    LResult.ReadBuffer(Result[0], LResult.Size);
+
+    Status('ELF object generated: %d bytes, %d functions, %d symbols',
+      [Length(Result), FCode.GetFuncCount(), LSymCount]);
+
   finally
-    if LLinker <> nil then
-      LLinker.Free();
-    LStaticCallFixups.Free();
-    LStaticSymbolNames.Free();
-    LStaticLibPaths.Free();
-    LStaticImportIndices.Free();
-    LDylibOrdinals.Free();
-    LDylibNames.Free();
+    LTextRelocs.Free();
+    LImportSymIndices.Free();
+    LTryBeginLabels.Free();
+    LExceptLabels.Free();
+    LFinallyLabels.Free();
+    LEndLabels.Free();
+    LFloatTemps.Free();
+    LDataPageFixups.Free();
     LForwardJumpFixups.Free();
     LCondJumpFixups.Free();
-    LFloatTemps.Free();
-    LLabelOffsets.Free();
-    LEndLabels.Free();
-    LFinallyLabels.Free();
-    LExceptLabels.Free();
-    LTryBeginLabels.Free();
     LJumpFixups.Free();
-    LGlobalFixups.Free();
-    LDataPageFixups.Free();
-    LFuncAddrFixups.Free();
-    LDataFixups.Free();
-    LImportFixups.Free();
-    LCallFixups.Free();
-    LFuncOffsets.Free();
-    LGotStream.Free();
-    LDataStream.Free();
-    LCStringStream.Free();
-    LTextStream.Free();
+    LRelaText.Free();
+    LSymtab.Free();
+    LShstrtabData.Free();
+    LStrtabData.Free();
+    LRoDataSection.Free();
+    LTextSection.Free();
+    LResult.Free();
+  end;
+end;
+
+//==============================================================================
+// GenerateArArchive -- Produces a Unix .a static library archive
+//==============================================================================
+
+function TTigerLinuxARM64Backend.GenerateArArchive(): TBytes;
+var
+  LObjData: TBytes;
+  LOutput: TMemoryStream;
+  LFunc: TTigerFuncInfo;
+  LParamTypes: TArray<TTigerValueType>;
+  LExportName: string;
+  LSymbolNames: TStringList;
+  LI, LJ: Integer;
+
+  // First linker member data
+  LNumSymbols: Cardinal;
+  LMemberOffset: Cardinal;
+
+  // AR header fields
+  LMemberName: AnsiString;
+  LMemberSize: Cardinal;
+  LTimestamp: Cardinal;
+  LHeaderStr: AnsiString;
+
+  //----------------------------------------------------------------------------
+  // Helper: Write a 60-byte AR member header
+  //----------------------------------------------------------------------------
+  procedure WriteARHeader(const AStream: TMemoryStream;
+    const AName: AnsiString; const ASize: Cardinal; const ATimestamp: Cardinal);
+  var
+    LHdr: array[0..59] of AnsiChar;
+    LSizeStr: AnsiString;
+    LTSStr: AnsiString;
+    LNamePadded: AnsiString;
+  begin
+    FillChar(LHdr, SizeOf(LHdr), ' ');
+
+    // Name (16 bytes, padded with spaces, terminated with '/')
+    if Length(AName) <= 15 then
+    begin
+      LNamePadded := AName + '/';
+      Move(LNamePadded[1], LHdr[0], Length(LNamePadded));
+    end
+    else
+    begin
+      // Long name would need /offset into longnames member (not implemented)
+      LNamePadded := AName;
+      if Length(LNamePadded) > 15 then
+        SetLength(LNamePadded, 15);
+      LNamePadded := LNamePadded + '/';
+      Move(LNamePadded[1], LHdr[0], Length(LNamePadded));
+    end;
+
+    // Timestamp (12 bytes)
+    LTSStr := AnsiString(IntToStr(ATimestamp));
+    Move(LTSStr[1], LHdr[16], Length(LTSStr));
+
+    // UID (6 bytes) - leave as spaces
+    // GID (6 bytes) - leave as spaces
+
+    // Mode (8 bytes) - '100644' for regular file
+    Move(AnsiString('100644')[1], LHdr[40], 6);
+
+    // Size (10 bytes)
+    LSizeStr := AnsiString(IntToStr(ASize));
+    Move(LSizeStr[1], LHdr[48], Length(LSizeStr));
+
+    // End marker
+    LHdr[58] := '`';
+    LHdr[59] := #10;
+
+    AStream.WriteBuffer(LHdr[0], 60);
+  end;
+
+begin
+  Result := nil;
+
+  // First, generate the ELF .o content
+  LObjData := GenerateELFObj();
+  if Length(LObjData) = 0 then
+  begin
+    Status('Error: ELF object generation failed, cannot create .a');
+    Exit;
+  end;
+
+  LOutput := TMemoryStream.Create();
+  LSymbolNames := TStringList.Create();
+  try
+    // Collect public symbol names for the archive symbol table
+    for LI := 0 to FCode.GetFuncCount() - 1 do
+    begin
+      LFunc := FCode.GetFunc(LI);
+      if LFunc.IsPublic then
+      begin
+        if LFunc.Linkage = plC then
+          LExportName := LFunc.FuncName
+        else
+        begin
+          SetLength(LParamTypes, Length(LFunc.Params));
+          for LJ := 0 to High(LFunc.Params) do
+            LParamTypes[LJ] := LFunc.Params[LJ].ParamType;
+          LExportName := TTigerABIMangler.MangleFunctionWithLinkage(
+            LFunc.FuncName, LParamTypes, LFunc.Linkage);
+        end;
+        LSymbolNames.Add(LExportName);
+      end;
+    end;
+    LNumSymbols := LSymbolNames.Count;
+    LTimestamp := DateTimeToUnix(Now(), False);
+
+    //==========================================================================
+    // AR Archive Structure:
+    //   Signature (8 bytes): !<arch>\n
+    //   First Linker Member (symbol table, "/" member)
+    //   Object Member (the ELF .o data)
+    //==========================================================================
+
+    // --- Write archive signature ---
+    LOutput.WriteBuffer(AnsiString('!<arch>'#10)[1], 8);
+
+    //==========================================================================
+    // First Linker Member ("/")
+    // Layout (BSD/GNU format):
+    //   4 bytes: Number of symbols (big-endian!)
+    //   4 bytes × N: Offsets to archive members (big-endian!)
+    //   N null-terminated symbol name strings
+    //==========================================================================
+
+    // Calculate first linker member data size
+    LMemberSize := 4 + (LNumSymbols * 4);  // Count + offsets array
+    for LI := 0 to LSymbolNames.Count - 1 do
+      LMemberSize := LMemberSize + Cardinal(Length(AnsiString(LSymbolNames[LI])) + 1);
+
+    // The object member starts after: signature + linker header + linker data + padding
+    LMemberOffset := 8 + 60 + LMemberSize;
+    if (LMemberOffset mod 2) <> 0 then
+      Inc(LMemberOffset);  // AR members are 2-byte aligned
+
+    // Write first linker member header
+    WriteARHeader(LOutput, '/', LMemberSize, LTimestamp);
+
+    // Write number of symbols (big-endian)
+    LOutput.WriteData(Byte((LNumSymbols shr 24) and $FF));
+    LOutput.WriteData(Byte((LNumSymbols shr 16) and $FF));
+    LOutput.WriteData(Byte((LNumSymbols shr 8) and $FF));
+    LOutput.WriteData(Byte(LNumSymbols and $FF));
+
+    // Write member offsets (big-endian) -- all symbols point to the single .o member
+    for LI := 0 to LSymbolNames.Count - 1 do
+    begin
+      LOutput.WriteData(Byte((LMemberOffset shr 24) and $FF));
+      LOutput.WriteData(Byte((LMemberOffset shr 16) and $FF));
+      LOutput.WriteData(Byte((LMemberOffset shr 8) and $FF));
+      LOutput.WriteData(Byte(LMemberOffset and $FF));
+    end;
+
+    // Write symbol name strings (null-terminated)
+    for LI := 0 to LSymbolNames.Count - 1 do
+    begin
+      LHeaderStr := AnsiString(LSymbolNames[LI]);
+      if Length(LHeaderStr) > 0 then
+        LOutput.WriteBuffer(LHeaderStr[1], Length(LHeaderStr));
+      LOutput.WriteData(Byte(0));
+    end;
+
+    // Pad to 2-byte alignment
+    if (LOutput.Size mod 2) <> 0 then
+      LOutput.WriteData(Byte(#10));
+
+    //==========================================================================
+    // Object Member (the .o file)
+    //==========================================================================
+    // Compute member name from output path
+    LMemberName := AnsiString(ExtractFileName(ChangeFileExt(FOutputPath, '.o')));
+    if Length(LMemberName) = 0 then
+      LMemberName := 'output.o';
+
+    // Write object member header
+    WriteARHeader(LOutput, LMemberName, Length(LObjData), LTimestamp);
+
+    // Write the ELF .o data
+    LOutput.WriteBuffer(LObjData[0], Length(LObjData));
+
+    // Pad to 2-byte alignment
+    if (LOutput.Size mod 2) <> 0 then
+      LOutput.WriteData(Byte(#10));
+
+    // --- Return result ---
+    SetLength(Result, LOutput.Size);
+    LOutput.Position := 0;
+    LOutput.ReadBuffer(Result[0], LOutput.Size);
+
+    Status('AR archive generated: %d bytes, %d public symbols, %d bytes object data',
+      [Length(Result), LNumSymbols, Length(LObjData)]);
+
+  finally
+    LSymbolNames.Free();
+    LOutput.Free();
   end;
 end;
 

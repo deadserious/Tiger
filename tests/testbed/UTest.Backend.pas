@@ -37,9 +37,10 @@ function OutputPath(const Plat : TTigerPlatform) : string;
 begin
   var PlatPath : string;
   case Plat of
-    tpWin64:   PlatPath := 'win';
-    tpLinux64: PlatPath := 'lin';
-    tpMacOS64: PlatPath := 'mac';
+    tpWin64:      PlatPath := 'win';
+    tpLinux64:    PlatPath := 'lin';
+    tpMacOS64:    PlatPath := 'mac';
+    tpLinuxARM64: PlatPath := 'linarm';
   end;
   Result := TPath.Combine(CBaseOutputPath, PlatPath);
 end;
@@ -153,7 +154,7 @@ begin
     else if LTiger.GetPlatform = tpMacOS64 then
       // macOS: runtime injects libSystem.B.dylib with printf, exit; no ImportDll needed
     else
-      // Linux: import printf from GNU C Library
+      // Linux (x64 and ARM64): import printf from GNU C Library
       LTiger.ImportDll('libc.so.6', 'printf', [vtPointer], vtInt32, True);
 
     // Define the program entry point
@@ -3892,10 +3893,12 @@ begin
       RunTest(TestNums, tpWin64, False)
     else if TestToRun = 'LINUXX64' then
       RunTest(TestNums, tpLinux64, False)
+    else if (TestToRun = 'LINUXARM64') or (TestToRun = 'LINUXAARCH64') then
+      RunTest(TestNums, tpLinuxARM64, False)
     else if TestToRun = 'MACOS64' then
       RunTest(TestNums, tpMacOS64, False)
     else
-      for var Plat := Low(TTigerPlatform) to High(TTigerPlatform) do
+      for var Plat in [tpWin64, tpLinux64, tpMacOS64, tpLinuxARM64] do
         RunTest(TestNums, Plat, False);
   except
     on E: Exception do
