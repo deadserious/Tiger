@@ -9,7 +9,7 @@
   See LICENSE for license information
 ===============================================================================}
 
-unit Tiger.Backend.MacOS64;
+unit Tiger.Backend.LinuxARM64;
 
 {$I Tiger.Defines.inc}
 
@@ -35,8 +35,8 @@ uses
   Tiger.ABI.MacOS64;
 
 type
-  { TTigerMacOS64Backend }
-  TTigerMacOS64Backend = class(TTigerBackend)
+  { TTigerLinuxARM64Backend }
+  TTigerLinuxARM64Backend = class(TTigerBackend)
   private
     function GenerateMachO(const AFileType: Cardinal; const AIsDylib: Boolean): TBytes;
     procedure EnsureOutputDir();
@@ -139,7 +139,7 @@ begin
   Result := LSHA1.HashAsString;
 end;
 
-procedure TTigerMacOS64Backend.EnsureOutputDir();
+procedure TTigerLinuxARM64Backend.EnsureOutputDir();
 begin
   if not TPath.HasExtension(FOutputPath) then
     TUtils.CreateDirInPath(FOutputPath + '.macho')
@@ -147,7 +147,7 @@ begin
     TUtils.CreateDirInPath(FOutputPath);
 end;
 
-function TTigerMacOS64Backend.TargetExe(const APath: string;
+function TTigerLinuxARM64Backend.TargetExe(const APath: string;
   const ASubsystem: TTigerSubsystem): TTigerBackend;
 begin
   FOutputPath := ChangeFileExt(APath, '');
@@ -156,12 +156,12 @@ begin
   Result := Self;
 end;
 
-procedure TTigerMacOS64Backend.PreBuild();
+procedure TTigerLinuxARM64Backend.PreBuild();
 begin
   EnsureOutputDir();
 end;
 
-function TTigerMacOS64Backend.BuildToMemory(): TBytes;
+function TTigerLinuxARM64Backend.BuildToMemory(): TBytes;
   function MakeArHeaderField(const AValue: AnsiString; const AWidth: Integer): AnsiString;
   begin
     Result := AValue;
@@ -243,17 +243,18 @@ begin
   end;
 end;
 
-function TTigerMacOS64Backend.BuildJIT(): TTigerJIT;
+function TTigerLinuxARM64Backend.BuildJIT(): TTigerJIT;
 begin
-  raise Exception.Create('macOS ARM64 JIT is not implemented');
+  raise Exception.Create('Linux ARM64 JIT is not implemented');
 end;
 
-function TTigerMacOS64Backend.Run(): Cardinal;
+function TTigerLinuxARM64Backend.Run(): Cardinal;
 begin
   {$IFDEF MSWINDOWS}
   Result := Tiger_ErrorBadFormat;
-  Status('Run not supported for macOS target from Windows. Copy binary to Mac and run there.');
+  Status('Run not supported for Linux ARM64 target from Windows. Copy binary to Linux ARM64 and run there.');
   {$ELSE}
+  {$IFDEF LINUX}
   if FOutputType <> otExe then
     Exit(Tiger_ErrorBadFormat);
   try
@@ -265,15 +266,19 @@ begin
       Result := Tiger_ErrorFileNotFound;
     end;
   end;
+  {$ELSE}
+  Result := Tiger_ErrorBadFormat;
+  Status('Run for Linux ARM64 is only supported on a Linux host.');
+  {$ENDIF}
   {$ENDIF}
 end;
 
-procedure TTigerMacOS64Backend.Clear();
+procedure TTigerLinuxARM64Backend.Clear();
 begin
   inherited Clear();
 end;
 
-function TTigerMacOS64Backend.GenerateMachO(const AFileType: Cardinal; const AIsDylib: Boolean): TBytes;
+function TTigerLinuxARM64Backend.GenerateMachO(const AFileType: Cardinal; const AIsDylib: Boolean): TBytes;
 var
   LCode: TTigerCodeBuilder;
   LData: TTigerDataBuilder;

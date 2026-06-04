@@ -1,4 +1,4 @@
-﻿{===============================================================================
+{===============================================================================
   Tiger™ Compiler Infrastructure.
 
   Copyright © 2025-present tinyBigGAMES™ LLC
@@ -20,7 +20,7 @@ uses
   System.Generics.Collections,
   System.IOUtils,
   Tiger.Utils,
-  Tiger.Utils.Win64,
+  Tiger.Utils.Host,
   Tiger.Errors,
   Tiger.Common,
   Tiger.Types,
@@ -281,7 +281,7 @@ type
   ///     automatically released when the object is destroyed.
   ///   </para>
   ///   <para>
-  ///     Platform-specific subclasses (TTigerJITWin64, TTigerJITLinux64) handle
+  ///     Platform-specific subclasses (TTigerJITWin64, TTigerJITLinux64 on Unix hosts) handle
   ///     memory allocation and dynamic library loading.
   ///   </para>
   /// </remarks>
@@ -3475,6 +3475,11 @@ implementation
 
 {$R Tiger.ResData.res}
 
+{$IFDEF MSWINDOWS}
+uses
+  Tiger.Utils.Win64;
+{$ENDIF}
+
 //==============================================================================
 // TTiger
 //==============================================================================
@@ -3508,6 +3513,10 @@ begin
       FBackend := TTigerMacOS64Backend.Create();
       FRuntime := TTigerMacOS64Runtime.Create();
     end;
+    tpLinuxARM64:
+      raise EArgumentException.Create('tpLinuxARM64 target is not yet integrated');
+    tpWinARM64:
+      raise EArgumentException.Create('tpWinARM64 target is not yet integrated');
   else
     raise EArgumentException.Create('Unsupported platform');
   end;
@@ -3531,6 +3540,7 @@ begin
 end;
 
 procedure TTiger.ApplyPostBuildResources(const AExePath: string);
+{$IFDEF MSWINDOWS}
 var
   LIconPath: string;
   LIsExe: Boolean;
@@ -3600,6 +3610,11 @@ begin
     end;
   end;
 end;
+{$ELSE}
+begin
+  { PE resource editing requires Windows APIs. }
+end;
+{$ENDIF}
 
 //------------------------------------------------------------------------------
 // Target Configuration
@@ -3661,8 +3676,11 @@ var
   LExitCode: Cardinal;
 begin
   case FPlatform of
-    tpWin64:   FBackend.Status('Platform: Win64');
-    tpLinux64: FBackend.Status('Platform: Linux64');
+    tpWin64:      FBackend.Status('Platform: Win64');
+    tpLinux64:    FBackend.Status('Platform: Linux64');
+    tpMacOS64:    FBackend.Status('Platform: macOS64');
+    tpLinuxARM64: FBackend.Status('Platform: LinuxARM64');
+    tpWinARM64:   FBackend.Status('Platform: WinARM64');
   end;
 
   // Strip any previously-injected runtime, then mark user code boundary
@@ -3716,8 +3734,11 @@ end;
 function TTiger.BuildJIT(): TTigerJIT;
 begin
   case FPlatform of
-    tpWin64:   FBackend.Status('Platform: Win64');
-    tpLinux64: FBackend.Status('Platform: Linux64');
+    tpWin64:      FBackend.Status('Platform: Win64');
+    tpLinux64:    FBackend.Status('Platform: Linux64');
+    tpMacOS64:    FBackend.Status('Platform: macOS64');
+    tpLinuxARM64: FBackend.Status('Platform: LinuxARM64');
+    tpWinARM64:   FBackend.Status('Platform: WinARM64');
   end;
 
   // Strip any previously-injected runtime, then mark user code boundary
