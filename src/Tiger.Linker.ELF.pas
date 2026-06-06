@@ -1391,6 +1391,7 @@ var
   LStream: TMemoryStream;
   LTarget: Cardinal;
 begin
+  {$Q-}
   LApplied := 0;
 
   // First, add LOCAL symbols from selected objects to FResolvedSymbols
@@ -1521,6 +1522,7 @@ begin
   FMergedRoData.Position := FMergedRoData.Size;
   FMergedData.Position := FMergedData.Size;
   Status('ELF Linker: Applied %d internal relocations', [LApplied]);
+  {$Q+}
 end;
 
 function TTigerELFLinker.GetMergedText(): TBytes;

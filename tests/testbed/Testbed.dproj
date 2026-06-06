@@ -1,7 +1,7 @@
 ﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{CC8CDC01-CCFC-41BF-91BC-A256422EA359}</ProjectGuid>
-        <ProjectVersion>20.3</ProjectVersion>
+        <ProjectVersion>20.4</ProjectVersion>
         <FrameworkType>None</FrameworkType>
         <Base>True</Base>
         <Config Condition="'$(Config)'==''">Debug</Config>
@@ -9,6 +9,7 @@
         <TargetedPlatforms>2</TargetedPlatforms>
         <AppType>Console</AppType>
         <MainSource>Testbed.dpr</MainSource>
+        <ProjectName Condition="'$(ProjectName)'==''">Testbed</ProjectName>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
         <Base>true</Base>
@@ -161,7 +162,7 @@
         <DCC_RemoteDebug>false</DCC_RemoteDebug>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Cfg_1_Win64)'!=''">
-        <Debugger_RunParams>MACOS64 ALL</Debugger_RunParams>
+        <Debugger_RunParams>LINUXARM64 ALL</Debugger_RunParams>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Cfg_2)'!=''">
         <DCC_LocalDebugSymbols>false</DCC_LocalDebugSymbols>
@@ -904,6 +905,9 @@
                     <Platform Name="Win64x">
                         <Operation>1</Operation>
                     </Platform>
+                    <Platform Name="WinARM64EC">
+                        <Operation>1</Operation>
+                    </Platform>
                 </DeployClass>
                 <DeployClass Name="ProjectiOSDeviceDebug">
                     <Platform Name="iOSDevice32">
@@ -974,6 +978,10 @@
                         <RemoteDir>Assets</RemoteDir>
                         <Operation>1</Operation>
                     </Platform>
+                    <Platform Name="WinARM64EC">
+                        <RemoteDir>Assets</RemoteDir>
+                        <Operation>1</Operation>
+                    </Platform>
                 </DeployClass>
                 <DeployClass Name="UWP_DelphiLogo44">
                     <Platform Name="Win32">
@@ -981,6 +989,10 @@
                         <Operation>1</Operation>
                     </Platform>
                     <Platform Name="Win64">
+                        <RemoteDir>Assets</RemoteDir>
+                        <Operation>1</Operation>
+                    </Platform>
+                    <Platform Name="WinARM64EC">
                         <RemoteDir>Assets</RemoteDir>
                         <Operation>1</Operation>
                     </Platform>
@@ -1197,6 +1209,7 @@
                 <ProjectRoot Platform="Win32" Name="$(PROJECTNAME)"/>
                 <ProjectRoot Platform="Win64" Name="$(PROJECTNAME)"/>
                 <ProjectRoot Platform="Win64x" Name="$(PROJECTNAME)"/>
+                <ProjectRoot Platform="WinARM64EC" Name="$(PROJECTNAME)"/>
             </Deployment>
             <Platforms>
                 <Platform value="Android">False</Platform>

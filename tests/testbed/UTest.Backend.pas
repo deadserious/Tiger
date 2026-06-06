@@ -76,13 +76,23 @@ end;
   ADumpSSA is True, the SSA intermediate representation is printed
   regardless of success or failure.
 ==============================================================================*)
+function ShouldAutoRun(const ATiger: TTiger): Boolean;
+begin
+{$IFDEF LINUX}
+  Result := True;
+{$ELSE}
+  // Linux ELF targets cannot run natively on Windows/macOS hosts.
+  Result := ATiger.GetPlatform() not in [tpLinux64, tpLinuxARM64];
+{$ENDIF}
+end;
+
 procedure ProcessBuild(const ATiger: TTiger; const ADumpSSA: Boolean=False);
 var
   LExitCode: Cardinal;
 begin
   LExitCode := 0;
   //THostUtils.PrintLn(COLOR_CYAN + 'Running...' + COLOR_RESET);
-  if ATiger.Build(True, @LExitCode) then
+  if ATiger.Build(ShouldAutoRun(ATiger), @LExitCode) then
   begin
     //THostUtils.PrintLn(COLOR_GREEN + 'Exit code: ' + LExitCode.ToString() + COLOR_RESET);
     THostUtils.PrintLn(COLOR_CYAN + 'Build: Success!' + COLOR_RESET);

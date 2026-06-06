@@ -357,6 +357,10 @@ const
   /// <summary>Linux x86-64 platform (ELF, System V AMD64 ABI).</summary>
   tpLinux64 = Tiger.Common.TTigerTargetPlatform.tpLinux64;
   tpMacOS64 = Tiger.Common.TTigerTargetPlatform.tpMacOS64;
+  /// <summary>Windows ARM64 platform (PE/COFF, Microsoft ARM64 ABI).</summary>
+  tpWinARM64 = Tiger.Common.TTigerTargetPlatform.tpWinARM64;
+  /// <summary>Linux ARM64 platform (ELF, AAPCS64 ABI).</summary>
+  tpLinuxARM64 = Tiger.Common.TTigerTargetPlatform.tpLinuxARM64;
 
   //--- Version ----------------------------------------------------------------
 

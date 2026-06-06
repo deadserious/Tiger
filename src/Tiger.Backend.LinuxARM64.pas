@@ -20,6 +20,7 @@ uses
   System.Classes,
   System.IOUtils,
   System.Math,
+  System.DateUtils,
   System.Generics.Collections,
   Tiger.Utils,
   Tiger.Utils.Host,
@@ -55,6 +56,11 @@ type
   end;
 
 implementation
+
+{$Q-}
+// AArch64 codegen performs unsigned 32-bit instruction packing and large
+// offset math. Testbed Debug enables $Q+; without this, EIntOverflow is raised
+// during harmless bit-or/shl expressions like $8B000000 or (REG_X16 shl 16).
 
 //==============================================================================
 // TTigerLinuxARM64Backend
@@ -240,7 +246,7 @@ var
   LLabelOffsets: TArray<Cardinal>;
 
   // Stack frame
-  LLocalsSize: Integer;
+  LLocalsSize: Cardinal;
   LMaxCallArgs: Integer;
   LOutgoingArgSpace: Cardinal;
   LStackFrameSize: Cardinal;
@@ -263,6 +269,7 @@ var
   LResult: TMemoryStream;
   LDataHandle: TTigerDataHandle;
   LDataEntryRec: TTigerDataEntry;
+  LByteOffset: Cardinal;
 
   // Dynamic linking
   LHasImports: Boolean;
@@ -318,6 +325,23 @@ var
   LGotEntryVAddr: UInt64;
   LRipAfterInstr: UInt64;
   LShstrPos: Cardinal;
+  LShNameInterp: Cardinal;
+  LShNameHash: Cardinal;
+  LShNameDynsym: Cardinal;
+  LShNameDynstr: Cardinal;
+  LShNameRelaPlt: Cardinal;
+  LShNameRodata: Cardinal;
+  LShNameData: Cardinal;
+  LShNamePlt: Cardinal;
+  LShNameText: Cardinal;
+  LShNameGotPlt: Cardinal;
+  LShNameDynamic: Cardinal;
+  LShNameShstrtab: Cardinal;
+  LShIdxHash: Integer;
+  LShIdxDynsym: Integer;
+  LShIdxDynstr: Integer;
+  LShIdxRelaPlt: Integer;
+  LShIdxPlt: Integer;
 
   // Static linking
   LLinker: TTigerELFLinker;
@@ -343,7 +367,7 @@ var
 
   // Exception handling (Linux64: setjmp/longjmp based)
   LExceptFrameSize: Integer;
-  LExceptFrameBaseOffset: Integer;
+  LExceptFrameBaseOffset: Cardinal;
   LTryBeginLabels: TDictionary<Integer, Integer>;   // label index -> scope index
   LExceptLabels: TDictionary<Integer, Integer>;     // label index -> scope index
   LFinallyLabels: TDictionary<Integer, Integer>;    // label index -> scope index
@@ -357,7 +381,7 @@ var
   LInitSignalsIdx: Integer;
   LInitCommandLineIdx: Integer;
   LScopeIdx: Integer;
-  LFrameOffset: Integer;
+  LFrameOffset: Cardinal;
   LExceptLabelIdx: Integer;
   //LFinallyLabelIdx: Integer;
 
@@ -383,6 +407,8 @@ var
 
   procedure EmitARM64(const AInsn: Cardinal);
   begin
+    // Always append: patch helpers leave Position mid-stream.
+    LTextSection.Position := LTextSection.Size;
     LTextSection.WriteData(AInsn);
   end;
 
@@ -396,12 +422,12 @@ var
   begin
     LInsnVA := BASE_VADDR + LTextFileOffset + ACodeOffset;
     LPageIdx := Int64(ATargetVA shr 12) - Int64(LInsnVA shr 12);
-    LAdrp := Cardinal((Int32(LPageIdx) + (1 shl 21)) and $1FFFFF);
+    LAdrp := AdrpPageImm21(LPageIdx);
     LOfs12 := Cardinal(ATargetVA and $FFF);
-    LInsn := $90000000 or AReg or ((LAdrp and 3) shl 29) or (((LAdrp shr 2) and $7FFFF) shl 5);
+    LInsn := EncodeInsnAdrp(AReg, LAdrp);
     LTextSection.Position := ACodeOffset;
     LTextSection.WriteData(LInsn);
-    LInsn := $91000000 or (LOfs12 shl 10) or (Cardinal(AReg) shl 5) or AReg;
+    LInsn := InsnMerge($91000000, [LOfs12 shl 10, RegShl(AReg, 5), AReg]);
     LTextSection.WriteData(LInsn);
   end;
 
@@ -419,23 +445,110 @@ var
   var
     LImm19: Int32;
     LInsn: Cardinal;
+    LMask: Cardinal;
   begin
+    if ACodeOffset + 4 > Cardinal(LTextSection.Size) then
+      Exit;
     LImm19 := Int32(ATargetOffset) - Int32(ACodeOffset);
     LImm19 := LImm19 div 4;
     LTextSection.Position := ACodeOffset;
     LTextSection.ReadData(LInsn, 4);
+    if (LInsn and $FF000000) = $54000000 then
+      LMask := $FFF0001F  // B.cond (e.g. ikVaArgAt B.GE)
+    else
+      LMask := $FF00001F; // CBZ/CBNZ placeholders (ikJumpIf / ikJumpIfNot)
     LTextSection.Position := ACodeOffset;
-    LTextSection.WriteData((LInsn and $FFF0001F) or ((Cardinal(LImm19) and $7FFFF) shl 5));
+    LTextSection.WriteData((LInsn and LMask) or ((Cardinal(LImm19) and $7FFFF) shl 5));
   end;
 
   procedure PatchUncondBranch(const ACodeOffset: Cardinal; const ATargetOffset: Cardinal);
   var
     LImm26: Int32;
   begin
+    if ACodeOffset + 4 > Cardinal(LTextSection.Size) then
+      Exit;
     LImm26 := Int32(ATargetOffset) - Int32(ACodeOffset);
     LImm26 := LImm26 div 4;
     LTextSection.Position := ACodeOffset;
     LTextSection.WriteData($14000000 or (Cardinal(LImm26) and $3FFFFFF));
+  end;
+
+  procedure AlignStream(const AStream: TMemoryStream; const AAlign: Cardinal);
+  var
+    LPad: Cardinal;
+  begin
+    if AStream.Size mod AAlign <> 0 then
+    begin
+      LPad := AAlign - (AStream.Size mod AAlign);
+      AStream.Position := AStream.Size;
+      while LPad > 0 do
+      begin
+        AStream.WriteData(Byte(0));
+        Dec(LPad);
+      end;
+    end;
+  end;
+
+  procedure WriteU64(const AStream: TMemoryStream; const AValue: UInt64);
+  begin
+    AStream.WriteBuffer(AValue, SizeOf(AValue));
+  end;
+
+  procedure WriteI64(const AStream: TMemoryStream; const AValue: Int64);
+  begin
+    AStream.WriteBuffer(AValue, SizeOf(AValue));
+  end;
+
+  function ElfHash(const AName: string): Cardinal;
+  var
+    LC: Integer;
+    LG: Cardinal;
+  begin
+    Result := 0;
+    for LC := 1 to Length(AName) do
+    begin
+      Result := (Result shl 4) + Cardinal(Ord(AName[LC]));
+      LG := Result and $F0000000;
+      if LG <> 0 then
+        Result := Result xor (LG shr 24);
+      Result := Result and (not LG);
+    end;
+  end;
+
+  procedure WriteShdr(const AStream: TMemoryStream;
+    const ANameIdx: Cardinal; const AType: Cardinal; const AFlags: UInt64;
+    const AAddr: UInt64; const AOffset: UInt64; const ASize: UInt64;
+    const ALink: Cardinal; const AInfo: Cardinal;
+    const AAddrAlign: UInt64; const AEntSize: UInt64);
+  var
+    L32: Cardinal;
+    L64: UInt64;
+  begin
+    // Write each field with an explicit byte width (Elf64_Shdr = 64 bytes).
+    L32 := ANameIdx;      AStream.WriteBuffer(L32, 4);   // sh_name
+    L32 := AType;         AStream.WriteBuffer(L32, 4);   // sh_type
+    L64 := AFlags;        AStream.WriteBuffer(L64, 8);   // sh_flags
+    L64 := AAddr;         AStream.WriteBuffer(L64, 8);   // sh_addr
+    L64 := AOffset;       AStream.WriteBuffer(L64, 8);   // sh_offset
+    L64 := ASize;         AStream.WriteBuffer(L64, 8);   // sh_size
+    L32 := ALink;         AStream.WriteBuffer(L32, 4);   // sh_link
+    L32 := AInfo;         AStream.WriteBuffer(L32, 4);   // sh_info
+    L64 := AAddrAlign;    AStream.WriteBuffer(L64, 8);   // sh_addralign
+    L64 := AEntSize;      AStream.WriteBuffer(L64, 8);   // sh_entsize
+  end;
+
+  procedure AddShstrtabName(const AName: AnsiString; out AOffset: Cardinal);
+  var
+    B: Byte;
+  begin
+    AOffset := Cardinal(LShstrtabSection.Size);
+    if Length(AName) > 0 then
+      LShstrtabSection.WriteBuffer(AName[1], Length(AName))
+    else
+    begin
+      B := 0;
+      LShstrtabSection.WriteBuffer(B, 1);
+    end;
   end;
 
   const
@@ -467,7 +580,8 @@ var
 
   function GetLocalOffset(const AIndex: Integer): Int32;
   var
-    LOffset, LK: Integer;
+    LOffset: Int64;
+    LK: Integer;
   begin
     // Locals live below the param spill area.
     LOffset := SpillBaseSize();
@@ -478,7 +592,8 @@ var
 
   function GetTempOffset(const ATempIndex: Integer): Int32;
   var
-    LOffset, LK: Integer;
+    LOffset: Int64;
+    LK: Integer;
   begin
     // Temps live below the locals area.
     LOffset := SpillBaseSize();
@@ -487,11 +602,6 @@ var
     // Temp 0 at [FP-(incoming_spill + locals + 8)], etc.
     LOffset := LOffset + (ATempIndex + 1) * 8;
     Result := -Int32(LOffset);
-  end;
-
-  procedure EmitARM64(const AInsn: Cardinal);
-  begin
-    LTextSection.WriteData(AInsn);
   end;
 
   procedure EmitMovX(const ADest, AVal: Byte);
@@ -734,7 +844,7 @@ var
     LImm: Cardinal;
   begin
     LImm := Cardinal(APage) and $1FFFFF;
-    EmitARM64($90000000 or ((LImm and $3) shl 29) or ((LImm shr 2) shl 16) or ARd);
+    EmitARM64(EncodeInsnAdrpLo16(ARd, LImm));
   end;
 
   procedure LoadOperandToReg(const AOp: TTigerOperand; const AReg: Byte);
@@ -751,36 +861,89 @@ var
           EmitLdrFp(AReg, GetLocalOffset(AOp.LocalHandle.Index));
       okData:
         begin
-          LDataFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, (AOp.DataHandle.Index shl 8) or AReg));
+          LDataFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size,
+            Integer((Cardinal(AOp.DataHandle.Index) shl 8) or Cardinal(AReg))));
           EmitAdrp(AReg, 0);
           EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
         end;
       okGlobal:
         begin
-          // Emit ADRP to __data base (X16) before each load; all target same page, fixed up by LDataPageFixups.
-          // Using one ADRP per load avoids preserving X16 across intervening instructions (ikAdd etc. clobber it).
-          LDataPageFixups.Add(LTextSection.Size);
-          EmitAdrp(REG_X16, 0);
-          LDataHandle.Index := AOp.DataHandle.Index;
-          LByteOffset := FGlobals.GetEntry(LDataHandle).Offset;
-          if LByteOffset <= 4095 then
-            EmitARM64($91000000 or (Cardinal(LByteOffset) shl 10) or (REG_X16 shl 5) or AReg)
-          else
-          begin
-            EmitMovRegImm64(REG_X17, LByteOffset);
-            EmitARM64($8B000000 or (REG_X17 shl 16) or (REG_X16 shl 5) or AReg);
-          end;
+          // ADRP + ADD to get address of global in .data; both ADRP page and
+          // ADD lo12 are patched in STEP 7 (LGlobalFixups) using the global's
+          // full virtual address. NOTE: .data is not page-aligned, so the ADD
+          // immediate must be (vaddr and $FFF), NOT the offset within .data.
+          LGlobalFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size,
+            Integer((Cardinal(AOp.DataHandle.Index) shl 8) or Cardinal(AReg))));
+          EmitAdrp(AReg, 0);
+          EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
         end;
       okFunc:
         begin
           // ADRP + ADD to get address of function in __text; patched in fixup pass.
-          LFuncAddrFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, (AOp.FuncHandle.Index shl 8) or AReg));
+          LFuncAddrFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size,
+            Integer((Cardinal(AOp.FuncHandle.Index) shl 8) or Cardinal(AReg))));
           EmitAdrp(AReg, 0);
           EmitARM64($91000000 or (0 shl 10) or (Cardinal(AReg) shl 5) or AReg);
         end;
     else
       EmitMovRegImm64(AReg, 0);
     end;
+  end;
+
+  //--------------------------------------------------------------------------
+  // Load call argument to register, handling large struct params.
+  // AAPCS64: structs > 16 bytes are passed indirectly (by pointer). When the
+  // source is a struct local (not a param), the caller must pass its ADDRESS,
+  // not the first 8 bytes of its value. A large-struct param already holds a
+  // pointer in its slot, so a plain load is correct there.
+  //--------------------------------------------------------------------------
+  procedure LoadCallArgToReg(const AOp: TTigerOperand; const AReg: Byte;
+    const ATargetFuncIndex: Integer; const AArgIndex: Integer);
+  var
+    LTargetFunc: TTigerFuncInfo;
+    LNeedsAddress: Boolean;
+  begin
+    LNeedsAddress := False;
+    if ATargetFuncIndex >= 0 then
+    begin
+      LTargetFunc := FCode.GetFunc(ATargetFuncIndex);
+      if (AArgIndex >= 0) and (AArgIndex < Length(LTargetFunc.Params)) then
+        if LTargetFunc.Params[AArgIndex].ParamSize > 16 then
+          if (AOp.Kind = okLocal) and (not AOp.LocalHandle.IsParam) then
+            LNeedsAddress := True;
+    end;
+
+    if LNeedsAddress then
+      EmitSubImm(AReg, REG_FP, Cardinal(-GetLocalOffset(AOp.LocalHandle.Index)))
+    else
+      LoadOperandToReg(AOp, AReg);
+  end;
+
+  //--------------------------------------------------------------------------
+  // Store call argument to an outgoing stack slot (args beyond x0-x7),
+  // with the same large-struct-by-pointer handling as LoadCallArgToReg.
+  //--------------------------------------------------------------------------
+  procedure StoreCallArgToStack(const AOp: TTigerOperand; const AArgIndex: Integer;
+    const ATargetFuncIndex: Integer);
+  var
+    LTargetFunc: TTigerFuncInfo;
+    LNeedsAddress: Boolean;
+  begin
+    LNeedsAddress := False;
+    if ATargetFuncIndex >= 0 then
+    begin
+      LTargetFunc := FCode.GetFunc(ATargetFuncIndex);
+      if (AArgIndex >= 0) and (AArgIndex < Length(LTargetFunc.Params)) then
+        if LTargetFunc.Params[AArgIndex].ParamSize > 16 then
+          if (AOp.Kind = okLocal) and (not AOp.LocalHandle.IsParam) then
+            LNeedsAddress := True;
+    end;
+
+    if LNeedsAddress then
+      EmitSubImm(REG_X16, REG_FP, Cardinal(-GetLocalOffset(AOp.LocalHandle.Index)))
+    else
+      LoadOperandToReg(AOp, REG_X16);
+    EmitStrX(REG_X16, REG_SP, Cardinal((AArgIndex - LINUXARM64_MAX_REG_ARGS) * 8));
   end;
 
   function UlebLen(const AValue: UInt64): Integer;
@@ -1239,7 +1402,7 @@ begin
       // Build hash chains for imports: symbol indices are 1..LImportCount
       for LI := 0 to LImportCount - 1 do
       begin
-        LEntry := FImports.GetEntryByIndex(LI);
+        LEntry := FImports.GetEntryByIndex(LDynamicImportIndices[LI]);
         LHashVal := ElfHash(LEntry.FuncName) mod LNBuckets;
         // Insert at head of bucket chain
         LChains[LI + 1] := LBuckets[LHashVal];
@@ -1368,19 +1531,19 @@ begin
           if Length(LFunc.Instructions[LJ].Args) > Integer(LMaxCallArgs) then
             LMaxCallArgs := Length(LFunc.Instructions[LJ].Args);
       if LMaxCallArgs > 8 then
-        LOutgoingArgSpace := LMaxCallArgs * 8
+        LOutgoingArgSpace := Cardinal(LMaxCallArgs) * 8
       else
         LOutgoingArgSpace := 64;
       LExceptFrameSize := Cardinal(Length(LFunc.ExceptionScopes)) * LINUXARM64_EXCEPT_FRAME_SIZE;
-      LExceptFrameBaseOffset := LIncomingSpillSize + LLocalsSize + Cardinal(LFunc.TempCount) * 8 + LOutgoingArgSpace;
+      LExceptFrameBaseOffset := LIncomingSpillSize + Cardinal(LLocalsSize) +
+        Cardinal(LFunc.TempCount) * 8 + LOutgoingArgSpace;
       if LExceptFrameSize > 0 then
       begin
-        LExceptFrameBaseOffset := (LExceptFrameBaseOffset + 15) and (not 15);
+        LExceptFrameBaseOffset := AlignUp16(LExceptFrameBaseOffset);
         LExceptFrameBaseOffset := LExceptFrameBaseOffset + 8;
       end;
       LStackFrameSize := LExceptFrameBaseOffset + LExceptFrameSize;
-      if (LStackFrameSize mod 16) <> 0 then
-        LStackFrameSize := (LStackFrameSize + 15) and (not 15);
+      LStackFrameSize := AlignUp16(LStackFrameSize);
 
       LTryBeginLabels.Clear();
       LExceptLabels.Clear();
@@ -1475,8 +1638,13 @@ begin
             end;
           ikCall:
             begin
-              for LK := 0 to Min(Length(LInstr.Args) - 1, 7) do
-                LoadOperandToReg(LInstr.Args[LK], LK);
+              // Stack args (beyond x0-x7) first, so loading register args does
+              // not clobber x16 used as the stack-store scratch register.
+              for LK := LINUXARM64_MAX_REG_ARGS to High(LInstr.Args) do
+                StoreCallArgToStack(LInstr.Args[LK], LK, LInstr.FuncTarget.Index);
+              for LK := 0 to Min(Length(LInstr.Args) - 1, LINUXARM64_MAX_REG_ARGS - 1) do
+                LoadCallArgToReg(LInstr.Args[LK], LINUXARM64_ARG_REGS[LK],
+                  LInstr.FuncTarget.Index, LK);
               LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LInstr.FuncTarget.Index));
               EmitBL(0);
               if LInstr.Dest.IsValid() then
@@ -1559,15 +1727,6 @@ begin
             begin
               LoadOperandToReg(LInstr.Op1, REG_X0);
               LoadOperandToReg(LInstr.Op2, REG_X16);
-              if False then
-              begin
-                EmitARM64($F1000000 or (REG_X16 shl 5) or 31);
-                EmitARM64($54000061 or ((3 and $7FFFF) shl 5));
-                EmitMovX(REG_X0, 42);
-                EmitMovX(REG_X1, 0);
-                LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LRaiseCodeIdx));
-                EmitBL(0);
-              end;
               EmitARM64($9BC07C00 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
               StoreTempFromReg(LInstr.Dest.Index, REG_X0);
             end;
@@ -1575,15 +1734,6 @@ begin
             begin
               LoadOperandToReg(LInstr.Op1, REG_X0);
               LoadOperandToReg(LInstr.Op2, REG_X16);
-              if False then
-              begin
-                EmitARM64($F1000000 or (REG_X16 shl 5) or 31);
-                EmitARM64($54000061 or ((3 and $7FFFF) shl 5));
-                EmitMovX(REG_X0, 42);
-                EmitMovX(REG_X1, 0);
-                LCallFixups.Add(TPair<Cardinal, Integer>.Create(LTextSection.Size, LRaiseCodeIdx));
-                EmitBL(0);
-              end;
               EmitARM64($AA0003E0 or (REG_X0 shl 5) or REG_X17);
               EmitARM64($9BC07C00 or (REG_X16 shl 16) or (REG_X0 shl 5) or REG_X0);
               EmitARM64($9B000000 or (REG_X16 shl 16) or (REG_X17 shl 10) or (REG_X0 shl 5) or REG_X17);
@@ -1888,17 +2038,17 @@ begin
               
               // Calculate offset for register path: -(8 + pos * 8)
               // X0 = position, compute offset in X16
-              EmitARM64($D37EF400 or (REG_X0 shl 5) or REG_X16);  // LSL X16, X0, #3 (pos * 8)
+              EmitARM64($D37DF000 or (REG_X0 shl 5) or REG_X16);  // LSL X16, X0, #3 (pos * 8)
               EmitAddImm(REG_X16, REG_X16, 8);                     // X16 = 8 + pos * 8
               
               // B.GE to stack args path (branch if position >= 8)
-              // B.cond encoding: [31:24]=0x54, [23:20]=cond (GE=0x0A), [19:5]=imm19, [4:0]=0x1E
+              // B.cond encoding: [31:24]=0x54, [23:5]=imm19, [4]=0, [3:0]=cond (GE=0x0A)
               var LBranchOffset := LTextSection.Size;
-              EmitARM64($540A001E);  // B.GE (placeholder offset=0, will be patched)
+              EmitARM64($5400000A);  // B.GE (placeholder offset=0, will be patched)
               
               // === Register arg path: [FP - (8 + pos * 8)] ===
               // X16 has (8 + pos * 8), compute [FP - X16] and load
-              EmitARM64($CB1003F0 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);  // SUB X16, FP, X16
+              EmitARM64($CB000000 or (REG_X16 shl 16) or (REG_FP shl 5) or REG_X16);  // SUB X16, FP, X16
               EmitLdrX(REG_X0, REG_X16, 0);                      // LDR X0, [X16]
               
               // Jump over stack path
@@ -1910,7 +2060,7 @@ begin
               // Restore position from X17
               var LStackPathStart := LTextSection.Size;
               EmitARM64($AA1103E0 or (REG_X17 shl 5) or REG_X0);  // MOV X0, X17
-              EmitARM64($D37EF400 or (REG_X0 shl 5) or REG_X0);    // LSL X0, X0, #3 (pos * 8)
+              EmitARM64($D37DF000 or (REG_X0 shl 5) or REG_X0);    // LSL X0, X0, #3 (pos * 8)
               EmitSubImm(REG_X0, REG_X0, 64);                      // X0 = (pos-8)*8
               EmitAddImm(REG_X16, REG_FP, 16);                     // X16 = FP + 16 (base)
               EmitARM64($8B000000 or (REG_X0 shl 16) or (REG_X16 shl 5) or REG_X16);  // ADD X16, X16, X0 → address
@@ -1949,23 +2099,33 @@ begin
       end;
 
       for LJ := 0 to LJumpFixups.Count - 1 do
-        PatchUncondBranch(LJumpFixups[LJ].Key, LLabelOffsets[LJumpFixups[LJ].Value]);
+        if LJumpFixups[LJ].Key + 4 <= Cardinal(LTextSection.Size) then
+          PatchUncondBranch(LJumpFixups[LJ].Key, LLabelOffsets[LJumpFixups[LJ].Value]);
       for LJ := 0 to LCondJumpFixups.Count - 1 do
-        PatchCondBranch(LCondJumpFixups[LJ].Key, LLabelOffsets[LCondJumpFixups[LJ].Value]);
+        if LCondJumpFixups[LJ].Key + 4 <= Cardinal(LTextSection.Size) then
+          PatchCondBranch(LCondJumpFixups[LJ].Key, LLabelOffsets[LCondJumpFixups[LJ].Value]);
       for LJ := 0 to LForwardJumpFixups.Count - 1 do
       begin
+        if (LForwardJumpFixups[LJ].Key + 4 > Cardinal(LTextSection.Size)) or
+           (LForwardJumpFixups[LJ].Value > Cardinal(LTextSection.Size)) then
+          Continue;
         LTextSection.Position := LForwardJumpFixups[LJ].Key;
         LTextSection.ReadData(LInsn, 4);
         if (LInsn and $FF000000) = $54000000 then
           PatchCondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value)
-        else
+        else if (LInsn and $FC000000) = $14000000 then
           PatchUncondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value);
       end;
       LJumpFixups.Clear();
       LCondJumpFixups.Clear();
       LForwardJumpFixups.Clear();
 
-      AlignStream(LTextSection, 16);
+      // Align between functions only; trailing padding must not precede _start.
+      if LI < FCode.GetFuncCount() - 1 then
+      begin
+        LTextSection.Position := LTextSection.Size;
+        AlignStream(LTextSection, 16);
+      end;
     end;
     // STEP 4b: Static linking - resolve symbols from .a archives
     //========================================================================
@@ -1990,7 +2150,6 @@ begin
       if Length(LMergedBytes) >= 8 then
       if Length(LMergedBytes) > 0 then
         LTextSection.WriteBuffer(LMergedBytes[0], Length(LMergedBytes));
-      AlignStream(LTextSection, 16);
 
       // Build static import resolution map: original import index -> offset in LTextSection
       LStaticResolved := LLinker.GetResolvedSymbols();
@@ -2039,9 +2198,9 @@ begin
     begin
       LPageIndex := Int64((BASE_VADDR + LDataFileOffset) shr 12) -
                     Int64((BASE_VADDR + LTextFileOffset + LDataPageFixups[LI]) shr 12);
-      LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
+      LAdrpImm := AdrpPageImm21(LPageIndex);
       LTextSection.Position := LDataPageFixups[LI];
-      LTextSection.WriteData($90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5));
+      LTextSection.WriteData(EncodeInsnAdrp(REG_X16, LAdrpImm));
     end;
 
     // STEP 8: Backpatch @func addresses
@@ -2058,7 +2217,11 @@ begin
       if LStaticImportResolved.TryGetValue(LPltFixups[LI].Value, LTargetOffset) then
         PatchBL(LPltFixups[LI].Key, LTargetOffset)
       else if LOrigToPltIndex.TryGetValue(LPltFixups[LI].Value, LPltSlotIndex) then
-        PatchBL(LPltFixups[LI].Key, (LPltFileOffset + 32 + Cardinal(LPltSlotIndex * 16)) - LTextFileOffset);
+        PatchBL(LPltFixups[LI].Key, (LPltFileOffset + 32 + Cardinal(LPltSlotIndex * 16)) - LTextFileOffset)
+      else
+        raise Exception.CreateFmt(
+          'Unpatched import call at .text+0x%x (import index %d)',
+          [LPltFixups[LI].Key, LPltFixups[LI].Value]);
     end;
     LTextSection.Position := LTextSection.Size;
 
@@ -2072,6 +2235,7 @@ begin
     end
     else
     begin
+      LTextSection.Position := LTextSection.Size;
       LEntryPointOffset := LTextSection.Size;
 
       if LMainIndex >= 0 then
@@ -2090,6 +2254,7 @@ begin
         if LHasSEH and (LInitSignalsIdx >= 0) then
           EmitBL(Int32(LFuncOffsets[LInitSignalsIdx]) - Int32(LTextSection.Size));
         EmitBL(Int32(LMainOffset) - Int32(LTextSection.Size));
+        // main return value is already in x0 (AAPCS64)
         EmitMovRegImm64(REG_X8, LINUXARM64_SYS_EXIT);
         EmitARM64($D4000001);
       end
@@ -2146,41 +2311,49 @@ begin
       for LI := 0 to LImportCount - 1 do
       begin
         // r_offset: VA of GOT[3+n]
-        LRelaPltSection.WriteData(
-          UInt64(BASE_VADDR + LGotPltFileOffset + Cardinal(3 + LI) * 8));
+        WriteU64(LRelaPltSection,
+          BASE_VADDR + LGotPltFileOffset + Cardinal(3 + LI) * 8);
         // r_info: ELF64_R_INFO(symbol_index, R_AARCH64_JUMP_SLOT)
-        LRelaPltSection.WriteData(
+        WriteU64(LRelaPltSection,
           UInt64((UInt64(LI + 1) shl 32) or R_AARCH64_JUMP_SLOT));
         // r_addend
-        LRelaPltSection.WriteData(Int64(0));
+        WriteI64(LRelaPltSection, 0);
       end;
 
       //--------------------------------------------------------------------
-      // Build .plt stubs
+      // Build .plt stubs (match GNU ld/LLD AArch64 lazy-binding layout)
       //--------------------------------------------------------------------
-      // PLT[0] resolver (32 bytes)
+      // PLT[0] resolver (32 bytes): stp; adrp/ldr/add/br to GOT[2]; nops
       begin
-        LPageIndex := Int64((BASE_VADDR + LGotPltFileOffset) shr 12) - Int64((BASE_VADDR + LPltFileOffset) shr 12);
-        LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
-        LPltSection.WriteData($90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5));
-        LPltSection.WriteData($F9400211);
-        LPltSection.WriteData($91004210);
-        LPltSection.WriteData($D61F0220);
-        LPltSection.WriteData($D503201F);
-        LPltSection.WriteData($D503201F);
-        LPltSection.WriteData($D503201F);
-        LPltSection.WriteData($D503201F);
+        LPltSection.WriteData($A9BF7BF0);  // stp x16, x30, [sp, #-16]!
+        LPageIndex := Int64((BASE_VADDR + LGotPltFileOffset + 16) shr 12) -
+                      Int64((BASE_VADDR + LPltFileOffset + 4) shr 12);
+        LAdrpImm := AdrpPageImm21(LPageIndex);
+        LOfs12 := Cardinal((BASE_VADDR + LGotPltFileOffset + 16) and $FFF);
+        LPltSection.WriteData(EncodeInsnAdrp(REG_X16, LAdrpImm));
+        LPltSection.WriteData(InsnMerge($F9400000,
+          [((LOfs12 div 8) shl 10), RegShl(REG_X16, 5), REG_X17]));
+        LPltSection.WriteData(InsnMerge($91000000,
+          [(LOfs12 shl 10), RegShl(REG_X16, 5), REG_X16]));
+        LPltSection.WriteData($D61F0220);  // br x17
+        LPltSection.WriteData($D503201F);  // nop
+        LPltSection.WriteData($D503201F);  // nop
+        LPltSection.WriteData($D503201F);  // nop
+        // PLT[0] is exactly 8 instructions (32 bytes); all offset math (+32)
+        // depends on this. Do NOT add a 4th nop here.
       end;
       for LI := 0 to LImportCount - 1 do
       begin
         LGotEntryVAddr := BASE_VADDR + LGotPltFileOffset + Cardinal(3 + LI) * 8;
         LRipAfterInstr := BASE_VADDR + LPltFileOffset + 32 + UInt64(LI) * 16;
         LPageIndex := Int64(LGotEntryVAddr shr 12) - Int64(LRipAfterInstr shr 12);
-        LAdrpImm := Cardinal((Int32(LPageIndex) + (1 shl 21)) and $1FFFFF);
+        LAdrpImm := AdrpPageImm21(LPageIndex);
         LOfs12 := Cardinal(LGotEntryVAddr and $FFF);
-        LPltSection.WriteData($90000000 or REG_X16 or ((LAdrpImm and 3) shl 29) or (((LAdrpImm shr 2) and $7FFFF) shl 5));
-        LPltSection.WriteData($F9400000 or ((LOfs12 div 8) shl 10) or (REG_X16 shl 5) or REG_X17));
-        LPltSection.WriteData($91000000 or (LOfs12 shl 10) or (REG_X16 shl 5) or REG_X16));
+        LPltSection.WriteData(EncodeInsnAdrp(REG_X16, LAdrpImm));
+        LPltSection.WriteData(InsnMerge($F9400000,
+          [((LOfs12 div 8) shl 10), RegShl(REG_X16, 5), REG_X17]));
+        LPltSection.WriteData(InsnMerge($91000000,
+          [(LOfs12 shl 10), RegShl(REG_X16, 5), REG_X16]));
         LPltSection.WriteData($D61F0220);
       end;
 
@@ -2188,15 +2361,14 @@ begin
       // Build .got.plt
       //--------------------------------------------------------------------
       // GOT[0] = VA of .dynamic
-      LGotPltSection.WriteData(UInt64(BASE_VADDR + LDynamicFileOffset));
+      WriteU64(LGotPltSection, BASE_VADDR + LDynamicFileOffset);
       // GOT[1] = 0 (link_map, filled by ld-linux)
-      LGotPltSection.WriteData(UInt64(0));
+      WriteU64(LGotPltSection, 0);
       // GOT[2] = 0 (_dl_runtime_resolve, filled by ld-linux)
-      LGotPltSection.WriteData(UInt64(0));
-      // GOT[3+n] = PLT[n]+6 (points to push instruction for lazy binding)
+      WriteU64(LGotPltSection, 0);
+      // GOT[3+n] = VA of PLT[0] (lazy binding jumps to resolver, not self)
       for LI := 0 to LImportCount - 1 do
-        LGotPltSection.WriteData(
-          UInt64(BASE_VADDR + LPltFileOffset + 32 + Cardinal(LI) * 16));
+        WriteU64(LGotPltSection, BASE_VADDR + LPltFileOffset);
 
       //--------------------------------------------------------------------
       // Build .dynamic
@@ -2262,22 +2434,21 @@ begin
       //--------------------------------------------------------------------
       LShstrtabFileOffset := LDynamicFileOffset + Cardinal(LDynamicSection.Size);
 
-      LShstrtabSection.WriteData(Byte(0));  // index 0 = empty
-      LShstrPos := 1;
-      // Write section names and track offsets for section headers
-      // Order: .interp .hash .dynsym .dynstr .rela.plt .rodata .data .plt .text .got.plt .dynamic .shstrtab
-      LShstrtabSection.WriteBuffer(AnsiString('.interp'#0)[1], 8);     // pos 1
-      LShstrtabSection.WriteBuffer(AnsiString('.hash'#0)[1], 6);       // pos 9
-      LShstrtabSection.WriteBuffer(AnsiString('.dynsym'#0)[1], 8);     // pos 15
-      LShstrtabSection.WriteBuffer(AnsiString('.dynstr'#0)[1], 8);     // pos 23
-      LShstrtabSection.WriteBuffer(AnsiString('.rela.plt'#0)[1], 10);  // pos 31
-      LShstrtabSection.WriteBuffer(AnsiString('.rodata'#0)[1], 8);     // pos 41
-      LShstrtabSection.WriteBuffer(AnsiString('.data'#0)[1], 6);       // pos 49
-      LShstrtabSection.WriteBuffer(AnsiString('.plt'#0)[1], 5);        // pos 55
-      LShstrtabSection.WriteBuffer(AnsiString('.text'#0)[1], 6);       // pos 60
-      LShstrtabSection.WriteBuffer(AnsiString('.got.plt'#0)[1], 9);    // pos 66
-      LShstrtabSection.WriteBuffer(AnsiString('.dynamic'#0)[1], 9);    // pos 75
-      LShstrtabSection.WriteBuffer(AnsiString('.shstrtab'#0)[1], 10);  // pos 84
+      LShstrtabSection.Clear();
+      AddShstrtabName('', LShNameInterp);  // sh_name index 0 = empty string at offset 0
+      if not LIsSharedObject then
+        AddShstrtabName(AnsiString('.interp'#0), LShNameInterp);
+      AddShstrtabName(AnsiString('.hash'#0), LShNameHash);
+      AddShstrtabName(AnsiString('.dynsym'#0), LShNameDynsym);
+      AddShstrtabName(AnsiString('.dynstr'#0), LShNameDynstr);
+      AddShstrtabName(AnsiString('.rela.plt'#0), LShNameRelaPlt);
+      AddShstrtabName(AnsiString('.rodata'#0), LShNameRodata);
+      AddShstrtabName(AnsiString('.data'#0), LShNameData);
+      AddShstrtabName(AnsiString('.plt'#0), LShNamePlt);
+      AddShstrtabName(AnsiString('.text'#0), LShNameText);
+      AddShstrtabName(AnsiString('.got.plt'#0), LShNameGotPlt);
+      AddShstrtabName(AnsiString('.dynamic'#0), LShNameDynamic);
+      AddShstrtabName(AnsiString('.shstrtab'#0), LShNameShstrtab);
 
       // Section headers follow .shstrtab
       LShdrsFileOffset := LShstrtabFileOffset + Cardinal(LShstrtabSection.Size);
@@ -2341,7 +2512,7 @@ begin
       begin
         LResult.WriteData(Word(ELF64_SHDR_SIZE)); // e_shentsize
         LResult.WriteData(Word(LSectionCount));    // e_shnum
-        LResult.WriteData(Word(12 - LInterpOffset)); // e_shstrndx (.shstrtab index)
+        LResult.WriteData(Word(LSectionCount - 1)); // e_shstrndx (.shstrtab index)
       end
       else
       begin
@@ -2494,55 +2665,63 @@ begin
         while Cardinal(LResult.Size) < LShdrsFileOffset do
           LResult.WriteData(Byte(0));
 
+        // Section header indices (must match write order below)
+        LShIdxHash := 1 + LInterpOffset;
+        LShIdxDynsym := LShIdxHash + 1;
+        LShIdxDynstr := LShIdxDynsym + 1;
+        LShIdxRelaPlt := LShIdxDynstr + 1;
+        LShIdxPlt := LShIdxRelaPlt + 3;  // .rodata, .data, then .plt
+
         // [0] SHN_UNDEF
         WriteShdr(LResult, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
         // [1] .interp (executables only)
         if not LIsSharedObject then
-          WriteShdr(LResult, 1, SHT_PROGBITS, SHF_ALLOC,
+          WriteShdr(LResult, LShNameInterp, SHT_PROGBITS, SHF_ALLOC,
             BASE_VADDR + LInterpFileOffset, LInterpFileOffset,
             Cardinal(LInterpSection.Size), 0, 0, 1, 0);
-        // [1 or 2] .hash
-        WriteShdr(LResult, 9, SHT_HASH, SHF_ALLOC,
+        // .hash
+        WriteShdr(LResult, LShNameHash, SHT_HASH, SHF_ALLOC,
           BASE_VADDR + LHashFileOffset, LHashFileOffset,
-          Cardinal(LHashSection.Size), 3 - LInterpOffset, 0, 8, 4);
-        // [3] .dynsym
-        WriteShdr(LResult, 15, SHT_DYNSYM, SHF_ALLOC,
+          Cardinal(LHashSection.Size), Cardinal(LShIdxDynsym), 0, 8, 4);
+        // .dynsym
+        WriteShdr(LResult, LShNameDynsym, SHT_DYNSYM, SHF_ALLOC,
           BASE_VADDR + LDynsymFileOffset, LDynsymFileOffset,
-          Cardinal(LDynsymSection.Size), 4 - LInterpOffset, 1, 8, ELF64_SYM_SIZE);
-        // [4] .dynstr
-        WriteShdr(LResult, 23, SHT_STRTAB, SHF_ALLOC,
+          Cardinal(LDynsymSection.Size), Cardinal(LShIdxDynstr), 1, 8, ELF64_SYM_SIZE);
+        // .dynstr
+        WriteShdr(LResult, LShNameDynstr, SHT_STRTAB, SHF_ALLOC,
           BASE_VADDR + LDynstrFileOffset, LDynstrFileOffset,
           Cardinal(LDynstrSection.Size), 0, 0, 1, 0);
-        // [5] .rela.plt
-        WriteShdr(LResult, 31, SHT_RELA, SHF_ALLOC or SHF_INFO_LINK,
+        // .rela.plt
+        WriteShdr(LResult, LShNameRelaPlt, SHT_RELA, SHF_ALLOC or SHF_INFO_LINK,
           BASE_VADDR + LRelaPltFileOffset, LRelaPltFileOffset,
-          Cardinal(LRelaPltSection.Size), 3 - LInterpOffset, 8 - LInterpOffset, 8, ELF64_RELA_SIZE);
-        // [6] .rodata
-        WriteShdr(LResult, 41, SHT_PROGBITS, SHF_ALLOC,
+          Cardinal(LRelaPltSection.Size), Cardinal(LShIdxDynsym),
+          Cardinal(LShIdxPlt), 8, ELF64_RELA_SIZE);
+        // .rodata
+        WriteShdr(LResult, LShNameRodata, SHT_PROGBITS, SHF_ALLOC,
           BASE_VADDR + LRoDataFileOffset, LRoDataFileOffset,
           Cardinal(LRoDataSection.Size), 0, 0, 16, 0);
-        // [7] .data
-        WriteShdr(LResult, 49, SHT_PROGBITS, SHF_ALLOC or SHF_WRITE,
+        // .data
+        WriteShdr(LResult, LShNameData, SHT_PROGBITS, SHF_ALLOC or SHF_WRITE,
           BASE_VADDR + LDataFileOffset, LDataFileOffset,
           Cardinal(LDataSection.Size), 0, 0, 16, 0);
-        // [8] .plt
-        WriteShdr(LResult, 55, SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
+        // .plt
+        WriteShdr(LResult, LShNamePlt, SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
           BASE_VADDR + LPltFileOffset, LPltFileOffset,
           Cardinal(LPltSection.Size), 0, 0, 16, 16);
-        // [9] .text
-        WriteShdr(LResult, 60, SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
+        // .text
+        WriteShdr(LResult, LShNameText, SHT_PROGBITS, SHF_ALLOC or SHF_EXECINSTR,
           BASE_VADDR + LTextFileOffset, LTextFileOffset,
           LTextSize, 0, 0, 16, 0);
-        // [10] .got.plt
-        WriteShdr(LResult, 66, SHT_PROGBITS, SHF_ALLOC or SHF_WRITE,
+        // .got.plt
+        WriteShdr(LResult, LShNameGotPlt, SHT_PROGBITS, SHF_ALLOC or SHF_WRITE,
           BASE_VADDR + LGotPltFileOffset, LGotPltFileOffset,
           Cardinal(LGotPltSection.Size), 0, 0, 8, 8);
-        // [11] .dynamic
-        WriteShdr(LResult, 75, SHT_DYNAMIC, SHF_ALLOC or SHF_WRITE,
+        // .dynamic
+        WriteShdr(LResult, LShNameDynamic, SHT_DYNAMIC, SHF_ALLOC or SHF_WRITE,
           BASE_VADDR + LDynamicFileOffset, LDynamicFileOffset,
-          Cardinal(LDynamicSection.Size), 4, 0, 8, ELF64_DYN_SIZE);
-        // [12] .shstrtab
-        WriteShdr(LResult, 84, SHT_STRTAB, 0,
+          Cardinal(LDynamicSection.Size), Cardinal(LShIdxDynstr), 0, 8, ELF64_DYN_SIZE);
+        // .shstrtab
+        WriteShdr(LResult, LShNameShstrtab, SHT_STRTAB, 0,
           0, LShstrtabFileOffset,
           Cardinal(LShstrtabSection.Size), 0, 0, 1, 0);
       end;
@@ -2587,6 +2766,9 @@ begin
     LDataFixups.Free();
     LJumpFixups.Free();
     LCallFixups.Free();
+    LCondJumpFixups.Free();
+    LForwardJumpFixups.Free();
+    LDataPageFixups.Free();
     LTextSection.Free();
     LDataSection.Free();
     LRoDataSection.Free();
@@ -2691,7 +2873,7 @@ var
 
   // Stack frame
   LStackFrameSize: Cardinal;
-  LLocalsSize: Integer;
+  LLocalsSize: Cardinal;
   LMaxCallArgs: Integer;
   LOutgoingArgSpace: Cardinal;
 
@@ -2704,7 +2886,7 @@ var
 
   // Exception handling (Linux64: setjmp/longjmp based)
   LExceptFrameSize: Integer;
-  LExceptFrameBaseOffset: Integer;
+  LExceptFrameBaseOffset: Cardinal;
   LTryBeginLabels: TDictionary<Integer, Integer>;   // label index -> scope index
   LExceptLabels: TDictionary<Integer, Integer>;     // label index -> scope index
   LFinallyLabels: TDictionary<Integer, Integer>;    // label index -> scope index
@@ -2718,7 +2900,7 @@ var
   LInitSignalsIdx: Integer;
   LInitCommandLineIdx: Integer;
   LScopeIdx: Integer;
-  LFrameOffset: Integer;
+  LFrameOffset: Cardinal;
   LExceptLabelIdx: Integer;
 
   // Float arg classification
@@ -2761,6 +2943,7 @@ var
 
   procedure EmitARM64(const AInsn: Cardinal);
   begin
+    LTextSection.Position := LTextSection.Size;
     LTextSection.WriteData(AInsn);
   end;
 
@@ -2768,19 +2951,28 @@ var
   var
     LImm19: Int32;
     LInsn: Cardinal;
+    LMask: Cardinal;
   begin
+    if ACodeOffset + 4 > Cardinal(LTextSection.Size) then
+      Exit;
     LImm19 := Int32(ATargetOffset) - Int32(ACodeOffset);
     LImm19 := LImm19 div 4;
     LTextSection.Position := ACodeOffset;
     LTextSection.ReadData(LInsn, 4);
+    if (LInsn and $FF000000) = $54000000 then
+      LMask := $FFF0001F
+    else
+      LMask := $FF00001F;
     LTextSection.Position := ACodeOffset;
-    LTextSection.WriteData((LInsn and $FFF0001F) or ((Cardinal(LImm19) and $7FFFF) shl 5));
+    LTextSection.WriteData((LInsn and LMask) or ((Cardinal(LImm19) and $7FFFF) shl 5));
   end;
 
   procedure PatchUncondBranch(const ACodeOffset: Cardinal; const ATargetOffset: Cardinal);
   var
     LImm26: Int32;
   begin
+    if ACodeOffset + 4 > Cardinal(LTextSection.Size) then
+      Exit;
     LImm26 := Int32(ATargetOffset) - Int32(ACodeOffset);
     LImm26 := LImm26 div 4;
     LTextSection.Position := ACodeOffset;
@@ -2809,7 +3001,8 @@ var
 
   function GetLocalOffset(const AIndex: Integer): Int32;
   var
-    LOffset, LK: Integer;
+    LOffset: Int64;
+    LK: Integer;
   begin
     LOffset := SpillBaseSize();
     for LK := 0 to AIndex do
@@ -2819,7 +3012,8 @@ var
 
   function GetTempOffset(const ATempIndex: Integer): Int32;
   var
-    LOffset, LK: Integer;
+    LOffset: Int64;
+    LK: Integer;
   begin
     LOffset := SpillBaseSize();
     for LK := 0 to High(LFunc.Locals) do
@@ -3050,7 +3244,7 @@ var
     LImm: Cardinal;
   begin
     LImm := Cardinal(APage) and $1FFFFF;
-    EmitARM64($90000000 or ((LImm and $3) shl 29) or ((LImm shr 2) shl 16) or ARd);
+    EmitARM64(EncodeInsnAdrpLo16(ARd, LImm));
   end;
 
   procedure AddCallReloc(const ASymIdx: Integer);
@@ -3256,6 +3450,22 @@ var
     LRelaText.WriteData(AAddend);
   end;
 
+  procedure AlignStream(const AStream: TMemoryStream; const AAlign: Cardinal);
+  var
+    LPad: Cardinal;
+  begin
+    if AStream.Size mod AAlign <> 0 then
+    begin
+      LPad := AAlign - (AStream.Size mod AAlign);
+      AStream.Position := AStream.Size;
+      while LPad > 0 do
+      begin
+        AStream.WriteData(Byte(0));
+        Dec(LPad);
+      end;
+    end;
+  end;
+
 begin
   Result := nil;
 
@@ -3427,7 +3637,7 @@ begin
 
       LLocalsSize := 0;
       for LJ := 0 to High(LFunc.Locals) do
-        LLocalsSize := LLocalsSize + LFunc.Locals[LJ].LocalSize;
+        LLocalsSize := LLocalsSize + Cardinal(LFunc.Locals[LJ].LocalSize);
 
       LExceptFrameSize := Length(LFunc.ExceptionScopes) * LINUXARM64_EXCEPT_FRAME_SIZE;
 
@@ -3454,20 +3664,19 @@ begin
             LMaxCallArgs := Length(LFunc.Instructions[LJ].Args);
 
       if LMaxCallArgs > 8 then
-        LOutgoingArgSpace := LMaxCallArgs * 8
+        LOutgoingArgSpace := Cardinal(LMaxCallArgs) * 8
       else
         LOutgoingArgSpace := 64;
 
-      LExceptFrameBaseOffset := LIncomingSpillSize + LLocalsSize +
+      LExceptFrameBaseOffset := LIncomingSpillSize + Cardinal(LLocalsSize) +
         Cardinal(LFunc.TempCount) * 8 + LOutgoingArgSpace;
       if LExceptFrameSize > 0 then
       begin
-        LExceptFrameBaseOffset := (LExceptFrameBaseOffset + 15) and (not 15);
+        LExceptFrameBaseOffset := AlignUp16(LExceptFrameBaseOffset);
         LExceptFrameBaseOffset := LExceptFrameBaseOffset + 8;
       end;
       LStackFrameSize := LExceptFrameBaseOffset + Cardinal(LExceptFrameSize);
-      if (LStackFrameSize mod 16) <> 0 then
-        LStackFrameSize := (LStackFrameSize + 15) and (not 15);
+      LStackFrameSize := AlignUp16(LStackFrameSize);
 
       EmitStpPre(REG_FP, REG_LR, REG_SP, -16);
       EmitARM64($910003E0 or (REG_SP shl 5) or REG_FP);
@@ -3928,18 +4137,24 @@ begin
       LFuncEndOffsets[LI] := Cardinal(LTextSection.Size);
 
       for LJ := 0 to LJumpFixups.Count - 1 do
-        PatchUncondBranch(LJumpFixups[LJ].Key, LLabelOffsets[LJumpFixups[LJ].Value]);
+        if LJumpFixups[LJ].Key + 4 <= Cardinal(LTextSection.Size) then
+          PatchUncondBranch(LJumpFixups[LJ].Key, LLabelOffsets[LJumpFixups[LJ].Value]);
       for LJ := 0 to LCondJumpFixups.Count - 1 do
-        PatchCondBranch(LCondJumpFixups[LJ].Key, LLabelOffsets[LCondJumpFixups[LJ].Value]);
+        if LCondJumpFixups[LJ].Key + 4 <= Cardinal(LTextSection.Size) then
+          PatchCondBranch(LCondJumpFixups[LJ].Key, LLabelOffsets[LCondJumpFixups[LJ].Value]);
       for LJ := 0 to LForwardJumpFixups.Count - 1 do
       begin
+        if (LForwardJumpFixups[LJ].Key + 4 > Cardinal(LTextSection.Size)) or
+           (LForwardJumpFixups[LJ].Value > Cardinal(LTextSection.Size)) then
+          Continue;
         LTextSection.Position := LForwardJumpFixups[LJ].Key;
         LTextSection.ReadData(LInsn, 4);
         if (LInsn and $FF000000) = $54000000 then
           PatchCondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value)
-        else
+        else if (LInsn and $FC000000) = $14000000 then
           PatchUncondBranch(LForwardJumpFixups[LJ].Key, LForwardJumpFixups[LJ].Value);
       end;
+      LTextSection.Position := LTextSection.Size;
     end;
 
     // Patch function symbol values and sizes
